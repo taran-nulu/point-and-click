@@ -1,0 +1,51 @@
+# Every tunable for point-and-click. This file is read at startup; nothing here
+# requires editing code.
+
+[camera]
+index = 0          # 0 is the built-in MacBook camera
+width = 640
+height = 480
+fps = 30
+mirror = true      # flip x once at input so "my right" == "cursor right"
+
+[aim]
+# The wrist-anchored model: the index fingertip is placed at a fixed distance
+# from the camera, measured in units of hand size, anchored at the wrist.
+#
+#   u = wrist + (index_tip - wrist) * (gain / scale)
+#
+# (tip - wrist) / scale is the fingertip's distance from the wrist in
+# hand-lengths, so gain says how many hand-lengths out you project to. An index
+# finger is ~1.1 hand-lengths, meaning:
+#
+#   1.0  = target sits exactly on the fingertip (no gain)
+#   0.5  = halfway back to the wrist; pointing direction dominates (default)
+#   >1.5 = overshoots; the cursor jams into a corner and stops responding
+#
+# Press +/- while running to tune live, then put the value here to keep it.
+# See README.md.
+gain = 0.5
+
+median_window = 3  # landmark outlier rejection; 1 disables
+min_cutoff = 1.2   # 1 Euro filter. Lower = smoother but laggier.
+beta = 0.02        # 1 Euro filter. Higher = less lag when moving fast.
+
+[gesture]
+# Click = fold your middle finger. Unfold to release.
+#
+# extension = |middle_tip - wrist| / |middle_pip - wrist|
+#
+# The two thresholds differ on purpose (hysteresis) so a finger resting near the
+# boundary does not chatter open and shut.
+extend_ratio = 1.35
+fold_ratio = 1.15
+confirm_frames = 2
+max_hold_ms = 2000  # auto-release, so a misdetected fold cannot stick the mouse
+
+[safety]
+hand_lost_release_ms = 250  # release the button this soon after losing your hand
+resume_grace_ms = 1500     # after the real mouse is touched, wait this long before resuming
+
+[preview]
+enabled = true
+window = "point-and-click"

@@ -1,0 +1,31 @@
+[project]
+name = "point-and-click"
+version = "0.1.0"
+description = "Control your computer cursor by pointing at the screen, using the camera."
+requires-python = ">=3.11"
+dependencies = [
+    # Pinned below 1.0 on purpose: mediapipe 1.0.x's macOS wheel aborts on the
+    # first detect_for_video call with
+    #   Check failed: service_  Service is unavailable   (graph_service.h)
+    # in both VIDEO and IMAGE mode, which is a packaging regression in the
+    # wheel rather than anything to do with this code. 0.10.35 works, and it
+    # ships a py3-none macOS wheel, so Python 3.13 is fine.
+    "mediapipe>=0.10.21,<1.0",
+    "pyobjc-framework-Quartz>=11.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pnc = "pnc.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
