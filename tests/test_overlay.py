@@ -39,7 +39,17 @@ def changed(before, after) -> bool:
 
 def test_draw_hand_marks_the_frame(frame, connections):
     before = frame.copy()
-    overlay.draw_hand(frame, pointing_hand(dx=1), connections, highlight_middle=True)
+    overlay.draw_hand(frame, pointing_hand(dx=1), connections, highlight={L.MIDDLE_TIP})
+    assert changed(before, frame)
+
+
+def test_draw_pinch_gauge_marks_the_frame(frame):
+    before = frame.copy()
+    overlay.draw_pinch_gauge(frame, pointing_hand(dx=1), closed=False)
+    assert changed(before, frame)
+
+    before = frame.copy()
+    overlay.draw_pinch_gauge(frame, pointing_hand(dx=1), closed=True)
     assert changed(before, frame)
 
 
@@ -89,5 +99,6 @@ def test_drawing_survives_landmarks_outside_the_frame(frame, connections):
     """MediaPipe can report coordinates slightly outside [0, 1]."""
     hand = pointing_hand(dx=1)
     hand[L.INDEX_TIP] = (-0.2, 1.4)
-    overlay.draw_hand(frame, hand, connections, highlight_middle=True)
+    overlay.draw_hand(frame, hand, connections, highlight={L.THUMB_TIP, L.INDEX_TIP})
+    overlay.draw_pinch_gauge(frame, hand, closed=True)
     overlay.draw_aim_point(frame, (1.8, -0.6))

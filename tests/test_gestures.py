@@ -9,7 +9,14 @@ from __future__ import annotations
 import pytest
 
 from pnc import landmarks as L
-from pnc.gestures import PRESS, RELEASE, ClickFSM, finger_bend_degrees, middle_extension
+from pnc.gestures import (
+    PRESS,
+    RELEASE,
+    ClickFSM,
+    finger_bend_degrees,
+    middle_extension,
+    pinch_gap,
+)
 
 EXTENDED = 1.6
 FOLDED = 1.0
@@ -62,11 +69,11 @@ def test_single_noise_frame_does_not_click():
 
 def test_hysteresis_band_does_not_chatter():
     """A finger resting inside the band must not open and shut the button."""
-    fsm = ClickFSM(extend_ratio=1.35, fold_ratio=1.15, confirm_frames=1)
+    fsm = ClickFSM(press_threshold=1.15, release_threshold=1.35, confirm_frames=1)
     now = 0
 
     for _ in range(20):
-        fsm.update(1.20, now)  # between fold and extend
+        fsm.update(1.20, now)  # between press and release
         now += 33
         fsm.update(1.22, now)
         now += 33
@@ -112,7 +119,7 @@ def test_none_extension_is_ignored():
 
 def test_rejects_a_nonsensical_hysteresis_band():
     with pytest.raises(ValueError):
-        ClickFSM(extend_ratio=1.1, fold_ratio=1.3)
+        ClickFSM(press_threshold=1.3, release_threshold=1.1)
 
 
 def test_finger_bend_degrees():
@@ -121,3 +128,87 @@ def test_finger_bend_degrees():
 
     curled = [(0.0, -1.0), (0.0, 0.0), (1.0, 0.0)]
     assert finger_bend_degrees(curled, 0, 1, 2) == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------- pinch
+
+
+def pinch_hand(thumb, index, wrist=(0.5, 0.6), middle_mcp=(0.5, 0.55), middle_tip=(0.5, 0.40)):
+    pts = [(0.0, 0.0)] * 21
+    pts[L.WRIST] = wrist
+    pts[L.MIDDLE_MCP] = middle_mcp
+    pts[L.THUMB_TIP] = thumb
+    pts[L.INDEX_TIP] = index
+    pts[L.MIDDLE_PIP] = (0.5, 0.52)
+    pts[L.MIDDLE_TIP] = middle_tip
+    return pts
+
+
+def test_pinch_gap_reports_small_when_touching():
+    # hand_scale here is |wrist - middle_mcp| = 0.05
+    closed = pinch_gap(pinch_hand((0.52, 0.45), (0.53, 0.45)))
+    open_hand = pinch_gap(pinch_hand((0.42, 0.55), (0.58, 0.45)))
+
+    assert closed < 0.35
+    assert open_hand > 0.5
+
+
+def test_pinch_gap_handles_a_degenerate_hand():
+    pts = [(0.0, 0.0)] * 21  # hand scale is zero
+    assert pinch_gap(pts) is None
+
+
+def test_pinch_fsm_presses_when_the_gap_closes():
+    """Pinch and middle-finger share one FSM: in both, the signal falls."""
+    fsm = ClickFSM(press_threshold=0.35, release_threshold=0.50, confirm_frames=2)
+
+    assert fsm.update(0.60, 0) is None  # open hand: nothing happens
+    assert fsm.update(0.20, 33) is None  # first closed frame is never enough
+    assert fsm.update(0.20, 66) == PRESS
+    assert fsm.update(0.60, 100) is None
+    assert fsm.update(0.60, 133) == RELEASE
+
+
+def test_pinch_fsm_has_a_hysteresis_band():
+    fsm = ClickFSM(press_threshold=0.35, release_threshold=0.50, confirm_frames=1)
+    for now in range(0, 600, 33):
+        fsm.update(0.42, now)  # between press and release
+    assert not fsm.pressed
+
+
+def test_pinch_rejects_an_inverted_band():
+    with pytest.raises(ValueError):
+        ClickFSM(press_threshold=0.50, release_threshold=0.35)
+
+
+def test_both_click_methods_fall_through_the_same_fsm():
+    """The property that lets one state machine serve both gestures."""
+    from pnc.config import Config
+    from pnc.gestures import MIDDLE_FINGER, PINCH, build_click_method
+
+    cfg = Config()
+    middle = build_click_method(MIDDLE_FINGER, cfg)
+    pinch = build_click_method(PINCH, cfg)
+
+    # Middle finger extended vs folded (tip far beyond PIP vs collapsed back).
+    extended_hand = pinch_hand((0.42, 0.55), (0.58, 0.45))
+    folded_hand = pinch_hand((0.42, 0.55), (0.58, 0.45), middle_tip=(0.5, 0.58))
+
+    assert middle_extension(extended_hand) >= middle.release_threshold
+    assert middle_extension(folded_hand) <= middle.press_threshold
+
+    # Pinched gap vs open hand.
+    assert pinch_gap(pinch_hand((0.52, 0.45), (0.53, 0.45))) <= pinch.press_threshold
+    assert pinch_gap(pinch_hand((0.42, 0.55), (0.58, 0.45))) >= pinch.release_threshold
+
+
+def test_click_method_factory_validates_and_freezes_correctly():
+    from pnc.config import Config
+    from pnc.gestures import MIDDLE_FINGER, PINCH, build_click_method
+
+    cfg = Config()
+    assert build_click_method(MIDDLE_FINGER, cfg).freeze_on_press is False
+    assert build_click_method(PINCH, cfg).freeze_on_press is True
+
+    with pytest.raises(ValueError):
+        build_click_method("telepathy", cfg)

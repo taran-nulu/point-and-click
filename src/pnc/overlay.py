@@ -31,7 +31,12 @@ def _px(point, width: int, height: int) -> tuple[int, int]:
     return (int(point[0] * width), int(point[1] * height))
 
 
-def draw_hand(frame, points, connections, highlight_middle: bool = False) -> None:
+def draw_hand(frame, points, connections, highlight: set | None = None) -> None:
+    """Draw the skeleton. ``highlight`` marks landmarks drawn large.
+
+    The app passes the landmarks of whichever finger is currently acting as the
+    button, so you can see at a glance what the click detector is reading.
+    """
     height, width = frame.shape[:2]
 
     for conn in connections:
@@ -41,19 +46,27 @@ def draw_hand(frame, points, connections, highlight_middle: bool = False) -> Non
 
     for idx, point in enumerate(points):
         centre = _px(point, width, height)
-        radius = 4 if idx in (L.WRIST,) else 2
+        if highlight and idx in highlight:
+            cv2.circle(frame, centre, 6, _CYAN, -1, cv2.LINE_AA)
+        radius = 4 if idx == L.WRIST else 2
         colour = _YELLOW if idx == L.INDEX_TIP else _WHITE
         cv2.circle(frame, centre, radius, colour, -1, cv2.LINE_AA)
-
-    # The click finger, drawn larger so you can see what is being read.
-    if highlight_middle:
-        for idx in (L.MIDDLE_TIP, L.MIDDLE_PIP):
-            cv2.circle(frame, _px(points[idx], width, height), 5, _CYAN, -1, cv2.LINE_AA)
 
     tip = _px(points[L.INDEX_TIP], width, height)
     size = 9
     cv2.line(frame, (tip[0] - size, tip[1]), (tip[0] + size, tip[1]), _YELLOW, 1, cv2.LINE_AA)
     cv2.line(frame, (tip[0], tip[1] - size), (tip[0], tip[1] + size), _YELLOW, 1, cv2.LINE_AA)
+
+
+def draw_pinch_gauge(frame, points, closed: bool) -> None:
+    """The thumb-to-index gap that pinch clicking reads, drawn as a bar."""
+    height, width = frame.shape[:2]
+    a = _px(points[L.THUMB_TIP], width, height)
+    b = _px(points[L.INDEX_TIP], width, height)
+    colour = _RED if closed else _CYAN
+    cv2.line(frame, a, b, colour, 2, cv2.LINE_AA)
+    if closed:
+        cv2.circle(frame, b, 11, colour, 2, cv2.LINE_AA)
 
 
 def draw_aim_point(frame, point, ok: bool = True) -> None:

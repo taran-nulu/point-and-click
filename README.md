@@ -4,14 +4,19 @@ Control your computer cursor by pointing at the screen with your hand.
 
 Hold your hand up to the camera with your **index finger extended**, like a
 laser pointer. Where the fingertip lands in the camera view drives the cursor.
-**Fold your middle finger to click**; unfold it to release. Keeping the click on
-a different finger means aiming never breaks while you click, and holding it
-down gives you a click-drag.
+
+To click, pick one of two gestures:
+
+| `--click-method` | Gesture | Notes |
+|---|---|---|
+| `middle-finger` *(default)* | Fold your middle finger | Aiming never breaks; **supports drag** |
+| `pinch` | Pinch thumb tip to index tip | More precise; latches the target; no drag |
 
 ```
 ./run.sh doctor      # check camera, permissions, throughput
 ./run.sh calibrate   # teach it where you point
-./run.sh run         # go
+./run.sh run                                  # middle-finger click
+./run.sh run --click-method pinch             # pinch click
 ```
 
 ## Requirements
@@ -80,20 +85,57 @@ feedback instead of having to trust yourself to aim at a physical bezel corner.
 
 ## Clicking
 
-Extension is `|middle_tip − wrist| / |middle_pip − wrist|`. Above `extend_ratio`
-the finger is out, below `fold_ratio` it is folded, and each must hold for
-`confirm_frames` consecutive frames to be believed.
+Both methods reduce to the same measurement: **a signal that falls when you
+press.** The middle finger's extension ratio drops as it folds; the pinch gap
+drops as your fingers close. So one state machine serves both.
+
+| Method | Signal | Press when | Release when |
+|---|---|---|---|
+| `middle-finger` | `\|middle_tip − wrist\| / \|middle_pip − wrist\|` | below `fold_ratio` | above `extend_ratio` |
+| `pinch` | `\|thumb_tip − index_tip\| / hand_scale` | below `press_ratio` | above `release_ratio` |
+
+Normalising both by a hand-sized reference is what makes the thresholds
+reusable at any distance from the camera.
 
 The two thresholds are deliberately different — a **hysteresis band**. Landmark
-noise is easily ±0.05 on this ratio, so a single threshold makes the click
-chatter open and shut whenever your finger rests near the boundary.
+noise is easily ±0.05 on these ratios, so a single threshold makes the click
+chatter open and shut whenever your hand rests near the boundary.
+
+### Why pinch latches, and middle-finger does not
+
+Pinching curls the index finger — the very finger doing the aiming. Without
+intervention, the cursor slides as you close the pinch and the click lands on
+whatever drifted underneath it. So pinch mode **latches the cursor position**
+the instant the press fires and holds it there until release. Pinching therefore
+cannot drag; use the middle-finger method for that.
+
+Middle-finger mode does not latch, because folding the middle finger only
+nudges the index tip, so the cursor stays live while held — which is exactly
+what makes click-drag work.
+
+### The thresholds are estimates, and they are personal
+
+The defaults in `config/default.toml` are reasoned guesses, not measurements,
+and gesture ranges vary a lot between hands. Rather than guess, measure yours:
+
+```
+./run.sh doctor --gestures
+```
+
+Point normally, fold the middle finger, and pinch a few times while it counts.
+It prints the observed range for both signals against the configured
+thresholds, and tells you which way to move them if clicks will never fire or
+never release. Paste the suggested numbers into the config.
+
+### Nothing gets stuck
 
 Two things make a stuck mouse button impossible:
 
-- `max_hold_ms` (2 s) auto-releases and then refuses to re-press until you
-  unfold, so a misdetected fold cannot leave a button down;
-- `mouseUp` is force-sent when your hand is lost, when the tool is paused, and
-  on exit, including `SIGINT` and `atexit`.
+- `max_hold_ms` (2 s) auto-releases and then refuses to re-press until you open
+  the gesture, so a misdetected press cannot leave a button down;
+- `mouseUp` is force-sent when your hand is lost, when the tool is paused, when
+  you switch click methods mid-press, and on exit, including `SIGINT`,
+  `SIGTERM` and `atexit`.
 
 ## The mouse is still yours
 
@@ -116,22 +158,29 @@ reasoning inline. The keys that matter, all adjustable live while running:
 | `aim.beta` | fast moves trail behind | fast moves overshoot |
 | `aim.median_window` | occasional wild jumps | legitimate fast motion gets eaten |
 | `gesture.fold_ratio` | clicks fire by accident | clicks miss |
+| `pinch.press_ratio` | pinches fire without pinching | pinches are missed |
 
 While `run` is going: `q` quit · `c` calibrate · `m` pause · `p` preview ·
-`+`/`-` gain. Gain changes are live; put the number in the config to keep it.
+`x` switch click method · `+`/`-` gain. Gain and click-method changes are live;
+put the numbers in the config to keep them.
+
+The HUD shows `click <method> <signal>` — that number is the raw measurement
+being thresholded. Watching it while you fold or pinch is the fastest way to
+set the thresholds by hand.
 
 **Watch the two dots in the preview.** The yellow crosshair is your fingertip,
 the magenta dot is where the aiming model resolved it. Converging, steady dots
 mean a working setup. If the magenta dot sits still while you move, the gain is
-saturating — lower it.
+saturating — lower it. In pinch mode a bar is also drawn between the thumb and
+index tips: red means the gap is closed enough to click.
 
 ## Commands
 
 ```
-pnc doctor [--camera N] [--no-benchmark]
+pnc doctor [--camera N] [--no-benchmark] [--gestures]
 pnc calibrate [--camera N]
 pnc run [--camera N] [--display N] [--gain G] [--no-preview]
-         [--recalibrate] [--from-video FILE]
+         [--recalibrate] [--from-video FILE] [--click-method METHOD]
 pnc record [--seconds S] [--output FILE]
 ```
 
@@ -147,19 +196,24 @@ fact. `pnc record` captures one to debug with.
 .venv/bin/python -m pytest
 ```
 
-61 tests, no camera or permissions required. They cover the aiming model's
-depth-invariance, the click state machine's safety guarantees, the smoothing
-filters, the homography fit, and the full frame loop driven by synthetic
-landmarks against a fake cursor.
+89 tests, no camera or permissions required. They cover the aiming model's
+depth-invariance, both click signals, the click state machine's safety
+guarantees, pinch latching vs. middle-finger dragging, the smoothing filters,
+the homography fit, doctor's threshold advice, and the full frame loop driven
+by synthetic landmarks against a fake cursor.
 
 ## Known limits
 
 - **One hand, index finger.** If you point with a different finger, or use the
   whole hand as a pointer, it will not track that.
+- **Pinch cannot drag**, by design — latching the target is what stops the
+  cursor sliding out from under the click. Use `middle-finger` for drag.
 - **Reaching the corners depends on calibration.** A narrow webcam field of view
   means you stretch to hit the edges; calibration amplifies whatever range you
   use, so a small range means more jitter near the edges. If corners are
   unreachable, lower `gain` and recalibrate.
+- **Click thresholds start as guesses.** They are hand-specific; run
+  `pnc doctor --gestures` and set them from your own measured range.
 - **Lighting matters.** MediaPipe needs contrast around the hand. A plain
   background and light from the front work best.
 - **One display at a time.** Not a virtual-desktop or multi-monitor spanning

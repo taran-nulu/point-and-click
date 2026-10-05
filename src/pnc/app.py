@@ -40,7 +40,7 @@ TRACKING = "TRACKING"
 CLICKING = "CLICKING"
 PAUSED = "PAUSED"
 
-_HELP = "q quit | c calibrate | m pause | p preview | +/- gain"
+_HELP = "q quit | c calibrate | m pause | p preview | +/- gain | x click method"
 
 
 def _now_ms() -> float:
@@ -56,6 +56,7 @@ class App:
         preview: bool | None = None,
         video_path: str | None = None,
         recalibrate: bool = False,
+        click_method: str | None = None,
     ) -> None:
         self.cfg = cfg
         self.gain = cfg.aim.gain if gain is None else gain
@@ -69,12 +70,10 @@ class App:
             min_cutoff=cfg.aim.min_cutoff,
             beta=cfg.aim.beta,
         )
-        self.fsm = gestures.ClickFSM(
-            extend_ratio=cfg.gesture.extend_ratio,
-            fold_ratio=cfg.gesture.fold_ratio,
-            confirm_frames=cfg.gesture.confirm_frames,
-            max_hold_ms=cfg.gesture.max_hold_ms,
+        self.click_method = gestures.build_click_method(
+            click_method or cfg.click_method, cfg
         )
+        self.fsm = gestures.ClickFSM.for_method(self.click_method, cfg)
         self.guard = InputGuard()
 
         self.matrix = calib.load(self.calib_path)
@@ -82,6 +81,7 @@ class App:
         self.calib_was_warned = False
         self.running = True
         self.start_calibration = recalibrate
+        self._click_anchor: tuple[float, float] | None = None
 
         self._lost_since: float | None = None
         self._hand_seen_since: float | None = None
@@ -167,7 +167,29 @@ class App:
         elif key in (ord("-"), ord("_")):
             self.gain = max(0.1, self.gain - 0.1)
             self._notify(f"gain {self.gain:.2f}", _now_ms())
+        elif key in (ord("x"), ord("X")):
+            self._cycle_click_method()
         return True
+
+    def _cycle_click_method(self) -> None:
+        """Switch click gesture live, so you can compare without restarting.
+
+        Worth having: which gesture feels right is personal, and the thresholds
+        for the other one are easier to judge while you can see the signal.
+        """
+        if self.cursor.button_down:
+            self.cursor.release()
+        self.fsm.force_release()
+        self._click_anchor = None
+        self.smoother.reset()
+
+        names = list(gestures.CLICK_METHOD_NAMES)
+        current = self.click_method.name
+        index = (names.index(current) + 1) % len(names) if current in names else 0
+
+        self.click_method = gestures.build_click_method(names[index], self.cfg)
+        self.fsm = gestures.ClickFSM.for_method(self.click_method, self.cfg)
+        self._notify(f"click: {self.click_method.help}", _now_ms(), ttl_ms=3500)
 
     # ------------------------------------------------------------------- loop
 
@@ -299,27 +321,46 @@ class App:
         # 2. Gestures.
         clicked_now = False
         if has_hand:
-            event = self.fsm.update(gestures.middle_extension(points), int(now))
+            event = self.fsm.update(self.click_method.signal(points), int(now))
             if event == gestures.PRESS:
                 self.cursor.press()
                 clicked_now = True
+                if self.click_method.freeze_on_press and screen_point is not None:
+                    # Latch where you were aiming when the click started, so the
+                    # distortion of the click gesture itself cannot move it.
+                    self._click_anchor = screen_point
             elif event == gestures.RELEASE:
                 self.cursor.release()
             if self.fsm.auto_released:
                 self.fsm.auto_released = False
                 self._notify("auto-released (held too long)", now)
 
+        if not self.fsm.pressed:
+            # Covers every release path in one place: a normal release, the
+            # hold timeout, a forced release on hand loss, and pause.
+            self._click_anchor = None
+
         paused = self.guard.tripped
         if has_hand and not paused and screen_point is not None:
-            self.guard.note_write(self.cursor.move(*screen_point))
+            target = self._click_anchor or screen_point
+            self.guard.note_write(self.cursor.move(*target))
 
         # 3. Draw.
         if self.preview and view is not None:
             self._draw(frame, points, aim_point, connections_list, now, has_hand, paused, clicked_now)
 
     def _draw(self, frame, points, aim_point, connections_list, now, has_hand, paused, clicked_now) -> None:
+        method = self.click_method
         if has_hand and points is not None:
-            overlay.draw_hand(frame, points, connections_list, highlight_middle=self.fsm.pressed)
+            highlight = set(method.highlight) if self.fsm.pressed else None
+            overlay.draw_hand(frame, points, connections_list, highlight=highlight)
+            if method.name == gestures.PINCH:
+                signal = method.signal(points)
+                overlay.draw_pinch_gauge(
+                    frame,
+                    points,
+                    closed=signal is not None and signal <= method.press_threshold,
+                )
             if aim_point is not None:
                 overlay.draw_aim_point(frame, aim_point)
             overlay.draw_minimap(frame, self.cursor.bounds, self.cursor.position())
@@ -333,14 +374,14 @@ class App:
         else:
             state, colour = LOST, overlay._YELLOW
 
-        extension = gestures.middle_extension(points) if has_hand else None
-        ratio_text = f"middle {extension:.2f}" if extension is not None else "middle --"
+        signal = method.signal(points) if has_hand else None
+        signal_text = f"{signal:.2f}" if signal is not None else "--"
 
         lines = [
             (f"{self._fps:4.0f} fps", overlay._WHITE),
             (f"state {state}", colour),
             (f"gain {self.gain:.2f}", overlay._WHITE),
-            (ratio_text, overlay._WHITE),
+            (f"click {method.label} {signal_text}", overlay._WHITE),
         ]
         if self._notice and now < self._notice[1]:
             lines.append((self._notice[0], overlay._CYAN))

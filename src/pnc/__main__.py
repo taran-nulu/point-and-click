@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-preview", action="store_true", help="hide the camera preview")
     run.add_argument("--recalibrate", action="store_true", help="calibrate before starting")
     run.add_argument("--from-video", help="replay a recording instead of using the camera")
+    run.add_argument(
+        "--click-method",
+        choices=("middle-finger", "pinch"),
+        help="how to click: fold the middle finger, or pinch thumb to index",
+    )
 
     calibrate = sub.add_parser("calibrate", help="interactive five-target calibration")
     calibrate.add_argument("--camera", type=int, help="camera index (default 0)")
@@ -37,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="diagnose camera, permissions and throughput")
     doctor.add_argument("--camera", type=int, default=0)
     doctor.add_argument("--no-benchmark", action="store_true", help="skip the live camera check")
+    doctor.add_argument(
+        "--gestures",
+        action="store_true",
+        help="measure your actual click-signal range to set thresholds from data",
+    )
 
     record = sub.add_parser("record", help="record the camera to a file for offline debugging")
     record.add_argument("--camera", type=int, help="camera index (default 0)")
@@ -53,7 +63,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from .doctor import main as doctor_main
 
-        return doctor_main(camera_index=args.camera, benchmark=not args.no_benchmark)
+        return doctor_main(
+            camera_index=args.camera,
+            benchmark=not args.no_benchmark,
+            gestures=args.gestures,
+        )
 
     if args.command == "record":
         return _record(cfg, args)
@@ -74,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
             preview=False if args.no_preview else None,
             video_path=args.from_video,
             recalibrate=args.recalibrate,
+            click_method=args.click_method,
         )
 
     try:

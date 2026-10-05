@@ -1,6 +1,10 @@
 # Every tunable for point-and-click. This file is read at startup; nothing here
 # requires editing code.
 
+# Which gesture clicks: "middle-finger" or "pinch".
+# Overridden by the --click-method flag on `pnc run`.
+click_method = "middle-finger"
+
 [camera]
 index = 0          # 0 is the built-in MacBook camera
 width = 640
@@ -31,16 +35,32 @@ min_cutoff = 1.2   # 1 Euro filter. Lower = smoother but laggier.
 beta = 0.02        # 1 Euro filter. Higher = less lag when moving fast.
 
 [gesture]
-# Click = fold your middle finger. Unfold to release.
+# Click = fold your middle finger. Unfold to release. Supports click-drag.
 #
-# extension = |middle_tip - wrist| / |middle_pip - wrist|
+#   extension = |middle_tip - wrist| / |middle_pip - wrist|
 #
-# The two thresholds differ on purpose (hysteresis) so a finger resting near the
-# boundary does not chatter open and shut.
+# The two thresholds differ on purpose (hysteresis) so a hand resting near the
+# boundary does not chatter open and shut. Set these from your own measured
+# range: `pnc doctor --gestures`.
 extend_ratio = 1.35
 fold_ratio = 1.15
 confirm_frames = 2
 max_hold_ms = 2000  # auto-release, so a misdetected fold cannot stick the mouse
+
+[pinch]
+# Click = bring the thumb tip to the index tip.
+#
+#   gap = |thumb_tip - index_tip| / hand_scale
+#
+# A pinched hand measures ~0.1-0.2; a hand at rest measures ~0.5-0.9.
+# release_ratio must exceed press_ratio (hysteresis band).
+press_ratio = 0.35
+release_ratio = 0.50
+
+# Pinching curls the index finger - the finger doing the aiming - so the cursor
+# would slide as you close the pinch. Latching pins the click where you aimed.
+# The trade-off: pinch cannot drag. Use the middle-finger method for dragging.
+freeze_on_press = true
 
 [safety]
 hand_lost_release_ms = 250  # release the button this soon after losing your hand

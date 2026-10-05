@@ -89,6 +89,28 @@ class GestureConfig:
 
 
 @dataclass
+class PinchConfig:
+    """Thumb-to-index pinch clicking.
+
+    The gap between the thumb and index tips, divided by hand size. Pinching
+    gives roughly 0.1-0.2; a hand at rest gives roughly 0.5-0.9.
+    """
+
+    press_ratio: float = 0.35
+    """Below this the pinch counts as pressed."""
+    release_ratio: float = 0.5
+    """Above this the pinch counts as open. Must exceed press_ratio."""
+    freeze_on_press: bool = True
+    """Latch the cursor position when a pinch starts.
+
+    Pinching curls the index finger, which is the finger doing the aiming, so
+    without latching the cursor slides as you close the pinch and can land on
+    whatever was next to your target. Latching pins the click where you aimed.
+    The cost is that pinch cannot drag - use the middle-finger method for that.
+    """
+
+
+@dataclass
 class SafetyConfig:
     hand_lost_release_ms: int = 250
     """Drop the cursor and release any button this soon after losing the hand."""
@@ -107,8 +129,16 @@ class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     aim: AimConfig = field(default_factory=AimConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
+    pinch: PinchConfig = field(default_factory=PinchConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
+
+    click_method: str = "middle-finger"
+    """Which gesture clicks: "middle-finger" or "pinch".
+
+    Overridden by ``--click-method``; here so the default can live in the config
+    file alongside the thresholds it selects between.
+    """
 
 
 def _merge_into(obj, data: dict) -> None:

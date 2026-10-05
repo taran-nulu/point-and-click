@@ -66,15 +66,30 @@ class FakeCursor:
         return [e for e in self.events if e[0] == "move"]
 
 
-def pointing_hand(dx=1.0, dy=0.0, wrist=(0.5, 0.5), middle_folded=False, scale=SCALE):
-    """A hand pointing in direction (dx, dy), index extended, middle optional."""
+def pointing_hand(
+    dx=1.0,
+    dy=0.0,
+    wrist=(0.5, 0.5),
+    middle_folded=False,
+    pinched=False,
+    scale=SCALE,
+):
+    """A hand pointing in direction (dx, dy).
+
+    Pinching moves the index tip *back towards the wrist*, which is what really
+    happens: the index curls to meet the thumb, and since the index tip is what
+    aims the cursor, an unlatched pinch would drag the cursor off target.
+    """
     norm = math.hypot(dx, dy)
     ux, uy = dx / norm, dy / norm
 
     pts = [wrist] * 21
     pts[L.WRIST] = wrist
     pts[L.MIDDLE_MCP] = (wrist[0], wrist[1] - scale)
-    pts[L.INDEX_TIP] = (wrist[0] + 1.1 * scale * ux, wrist[1] + 1.1 * scale * uy)
+
+    index_reach = 0.7 if pinched else 1.1
+    index_tip = (wrist[0] + index_reach * scale * ux, wrist[1] + index_reach * scale * uy)
+    pts[L.INDEX_TIP] = index_tip
 
     # The middle finger points along the same direction as the index.
     pts[L.MIDDLE_PIP] = (wrist[0] + 1.2 * scale * ux, wrist[1] + 1.2 * scale * uy)
@@ -82,6 +97,13 @@ def pointing_hand(dx=1.0, dy=0.0, wrist=(0.5, 0.5), middle_folded=False, scale=S
         wrist[0] + (0.35 if middle_folded else 2.2) * scale * ux,
         wrist[1] + (0.35 if middle_folded else 2.2) * scale * uy,
     )
+
+    # The thumb sits off to the side at rest, and meets the index to pinch.
+    pts[L.THUMB_MCP] = (wrist[0] - 0.6 * scale * ux, wrist[1] - 0.6 * scale * uy)
+    if pinched:
+        pts[L.THUMB_TIP] = (index_tip[0] + 0.15 * scale * ux, index_tip[1] + 0.15 * scale * uy)
+    else:
+        pts[L.THUMB_TIP] = (wrist[0] - 1.0 * scale * ux, wrist[1] - 1.0 * scale * uy)
     return pts
 
 
@@ -92,6 +114,19 @@ def app(monkeypatch):
 
     monkeypatch.setattr(app_module, "Cursor", FakeCursor)
     instance = app_module.App(Config())
+    instance.preview = False
+    instance._aspect = FRAME_ASPECT
+    instance._refresh_projector(FRAME_ASPECT)
+    return instance
+
+
+@pytest.fixture
+def app_pinch(monkeypatch):
+    """An App wired to a FakeCursor, configured for pinch clicking."""
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config(click_method="pinch"))
     instance.preview = False
     instance._aspect = FRAME_ASPECT
     instance._refresh_projector(FRAME_ASPECT)
@@ -255,3 +290,151 @@ def test_config_file_parses_and_overrides_defaults():
     assert cfg.gesture.fold_ratio < cfg.gesture.extend_ratio  # hysteresis is sane
     assert 0.2 < cfg.aim.gain < 1.0  # a usable default, not a runaway
     assert cfg.preview.enabled is True
+
+
+# ---------------------------------------------------------------------- pinch
+
+
+def test_pinch_gap_is_small_when_pinched_and_large_when_open():
+    from pnc.gestures import pinch_gap
+
+    closed = pinch_gap(pointing_hand(pinched=True))
+    open_hand = pinch_gap(pointing_hand(pinched=False))
+
+    assert closed < 0.35
+    assert open_hand > 0.5
+
+
+def test_pinch_gap_is_unchanged_by_hand_depth():
+    """Normalising by hand size must make the gap depth-invariant."""
+    from pnc.gestures import pinch_gap
+
+    near = pinch_gap(pointing_hand(pinched=True, scale=SCALE))
+    far = pinch_gap(pointing_hand(pinched=True, scale=SCALE / 2))
+    assert near == pytest.approx(far)
+
+
+def test_pinch_clicks(app_pinch):
+    settled(app_pinch, pointing_hand(pinched=True))
+    assert ("press",) in app_pinch.cursor.events
+    assert app_pinch.cursor.button_down
+
+
+def test_releasing_the_pinch_releases_the_button(app_pinch):
+    now = settled(app_pinch, pointing_hand(pinched=True))
+    assert app_pinch.cursor.button_down
+
+    feed(app_pinch, pointing_hand(pinched=False), now, dt=1 / 30)
+    feed(app_pinch, pointing_hand(pinched=False), now + 33, dt=1 / 30)
+    assert ("release",) in app_pinch.cursor.events
+    assert not app_pinch.cursor.button_down
+
+
+def test_open_hand_never_clicks_with_pinch(app_pinch):
+    settled(app_pinch, pointing_hand(pinched=False))
+    assert ("press",) not in app_pinch.cursor.events
+
+
+def test_folded_middle_finger_does_not_click_in_pinch_mode(app_pinch):
+    """The two methods must not fire on each other's gesture."""
+    settled(app_pinch, pointing_hand(middle_folded=True, pinched=False))
+    assert ("press",) not in app_pinch.cursor.events
+
+
+def test_pinch_freezes_the_cursor_on_press(app_pinch):
+    """Once a pinch registers, the cursor must stop responding entirely.
+
+    Pinching curls the index - the finger doing the aiming - so without latching
+    the cursor slides under the click and can land on whatever was next to your
+    target. The latch is taken when the press fires, so the drift from the
+    fingers *closing* is unavoidable; what must never happen is the cursor
+    continuing to move for the rest of the click.
+    """
+    assert app_pinch.click_method.freeze_on_press is True
+    app_pinch.fsm.max_hold_ms = 60_000  # isolate this from the hold timeout
+
+    # Aim somewhere with the hand open.
+    settled(app_pinch, pointing_hand(dx=1, pinched=False))
+    aimed = app_pinch.cursor.position()
+
+    # Now pinch. The index tip retracts, so without latching the cursor moves.
+    settled(app_pinch, pointing_hand(dx=1, pinched=True), start_ms=5000)
+    assert app_pinch.cursor.button_down
+    latched = app_pinch.cursor.position()
+    assert latched != pytest.approx(aimed)  # the pinch really did move it
+
+    # And it stays pinned for the whole hold.
+    settled(app_pinch, pointing_hand(dx=-1, pinched=True), start_ms=9000)
+    settled(app_pinch, pointing_hand(dx=0, dy=1, pinched=True), start_ms=13_000)
+    assert app_pinch.cursor.button_down
+    assert app_pinch.cursor.position() == pytest.approx(latched)
+
+    # Releasing hands control straight back.
+    feed(app_pinch, pointing_hand(dx=1, pinched=False), 20_000, dt=1 / 30)
+    feed(app_pinch, pointing_hand(dx=1, pinched=False), 20_100, dt=1 / 30)
+    assert not app_pinch.cursor.button_down
+
+
+def test_pinch_drift_before_the_press_is_bounded(app_pinch):
+    """The latch cannot help with drift that happens before the press fires."""
+    app_pinch.fsm.max_hold_ms = 60_000
+
+    settled(app_pinch, pointing_hand(dx=1, pinched=False))
+    aimed = app_pinch.cursor.position()
+
+    settled(app_pinch, pointing_hand(dx=1, pinched=True), start_ms=5000)
+    assert app_pinch.cursor.button_down
+
+    # The pinch itself nudges the cursor before the press fires. That is finite
+    # and small - not a runaway - and it stops dead once pressed.
+    drift = math.dist(app_pinch.cursor.position(), aimed)
+    assert drift < SCREEN_W * 0.25
+
+
+def test_middle_finger_method_does_not_freeze(app):
+    """Freezing would break click-drag, which the middle finger supports."""
+    assert app.click_method.freeze_on_press is False
+    app.fsm.max_hold_ms = 60_000  # isolate this from the hold timeout
+
+    settled(app, pointing_hand(dx=1, middle_folded=True))
+    assert app.cursor.button_down
+    before = app.cursor.position()
+
+    settled(app, pointing_hand(dx=-1, middle_folded=True), start_ms=5000)
+    assert app.cursor.button_down  # still held
+    assert math.dist(app.cursor.position(), before) > 50  # and it moved: drag works
+
+
+def test_click_method_flag_selects_the_method():
+    from pnc import app as app_module
+    from pnc.gestures import PINCH, MIDDLE_FINGER, build_click_method
+
+    cfg = Config()
+    assert build_click_method(MIDDLE_FINGER, cfg).name == MIDDLE_FINGER
+    assert build_click_method(PINCH, cfg).name == PINCH
+    assert app_module is not None
+
+    with pytest.raises(ValueError):
+        build_click_method("double-tap", cfg)
+
+
+def test_cycling_click_methods_rebuilds_the_state_machine(app):
+    from pnc.gestures import CLICK_METHOD_NAMES
+
+    start = app.click_method.name
+    app._cycle_click_method()
+    assert app.click_method.name != start
+    assert app.fsm.press_threshold == app.click_method.press_threshold
+    assert app.click_method.name in CLICK_METHOD_NAMES
+
+    app._cycle_click_method()
+    assert app.click_method.name == start
+
+
+def test_switching_method_while_pressed_releases_the_button(app):
+    """Never leave a button down just because the gesture changed."""
+    settled(app, pointing_hand(dx=1, middle_folded=True))
+    assert app.cursor.button_down
+
+    app._cycle_click_method()
+    assert not app.cursor.button_down
