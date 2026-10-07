@@ -58,6 +58,8 @@ def run_doctor(camera_index: int = 0, benchmark: bool = True) -> int:
     # --- permissions ------------------------------------------------------
     from .cursor import is_accessibility_trusted, list_displays
 
+    import Quartz
+
     trusted = is_accessibility_trusted()
     _line(
         trusted,
@@ -71,10 +73,20 @@ def run_doctor(camera_index: int = 0, benchmark: bool = True) -> int:
 
     # --- displays ---------------------------------------------------------
     displays = list_displays()
+    main_rect = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
     if displays:
         for i, (x, y, w, h) in enumerate(displays):
             label = "display 0 (main)" if i == 0 else f"display {i}"
             _line(True, label, f"{w:.0f}x{h:.0f} at ({x:.0f},{y:.0f}) points")
+    elif main_rect.size.width > 0:
+        # The active-display list can come back empty in a session without a
+        # window server, but the main display is still usable and that is all
+        # the tool needs for --display 0.
+        _warn(
+            "displays",
+            f"active list empty; using main display "
+            f"{main_rect.size.width:.0f}x{main_rect.size.height:.0f}",
+        )
     else:
         _line(False, "displays", "none active")
         failures += 1
@@ -246,8 +258,8 @@ def _gesture_report(duration_s: float, config) -> int:
             if found:
                 hands_seen += 1
                 for hand in found:
-                    m = middle_extension(hand)
-                    p = pinch_gap(hand)
+                    m = middle_extension(hand.landmarks)
+                    p = pinch_gap(hand.landmarks)
                     if m is not None:
                         middles.append(m)
                     if p is not None:

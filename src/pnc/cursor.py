@@ -59,19 +59,25 @@ class Cursor:
     """A single target display, plus press/release bookkeeping."""
 
     def __init__(self, display_index: int = 0) -> None:
-        displays = list_displays()
-        if not displays:
-            raise RuntimeError("No active displays found.")
-
         if display_index <= 0:
+            # The main display is queryable directly, so do not depend on the
+            # active-display list: it can come back empty in a session that has
+            # no GUI window server attached, while the main display is still
+            # perfectly usable.
             rect = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
             self.bounds = (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
-        elif display_index <= len(displays):
-            self.bounds = displays[display_index - 1]
         else:
-            raise RuntimeError(
-                f"Display {display_index} requested, but only {len(displays)} active."
-            )
+            displays = list_displays()
+            if not displays:
+                raise RuntimeError(
+                    "No active displays found, so display "
+                    f"{display_index} cannot be selected. Use --display 0 for the main one."
+                )
+            if display_index > len(displays):
+                raise RuntimeError(
+                    f"Display {display_index} requested, but only {len(displays)} active."
+                )
+            self.bounds = displays[display_index - 1]
 
         self.x0, self.y0, self.width, self.height = self.bounds
         self._last_written: tuple[float, float] | None = None

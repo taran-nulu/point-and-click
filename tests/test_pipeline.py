@@ -438,3 +438,199 @@ def test_switching_method_while_pressed_releases_the_button(app):
 
     app._cycle_click_method()
     assert not app.cursor.button_down
+
+
+# ----------------------------------------------------------------- elbow pivot
+
+
+@pytest.fixture
+def elbow_app(monkeypatch):
+    """An App pivoting from the elbow."""
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config(pivot="elbow"))
+    instance.preview = False
+    instance._aspect = FRAME_ASPECT
+    instance._refresh_projector(FRAME_ASPECT)
+    instance.fsm.max_hold_ms = 60_000
+    return instance
+
+
+def feed_elbow(app, points, elbow, now_ms: float, dt: float | None = None):
+    app._step(points, now_ms, dt, None, None, None, elbow)
+
+
+def settle_elbow(app, points, elbow, frames=40, start_ms=0.0):
+    now = start_ms
+    for _ in range(frames):
+        feed_elbow(app, points, elbow, now, dt=1 / 30)
+        now += 33.3
+    return now
+
+
+def test_elbow_pivot_uses_a_smaller_gain_than_the_wrist(monkeypatch):
+    """The two pivots need different gains because their levers differ."""
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config(pivot="elbow"))
+    assert instance.gain == pytest.approx(instance.cfg.aim.gain_elbow)
+    assert instance.gain < instance.cfg.aim.gain
+
+
+def test_default_pivot_is_the_wrist(app):
+    assert app.pivot == "wrist"
+    assert app.effective_pivot == "wrist"
+    assert app.gain == pytest.approx(app.cfg.aim.gain)
+
+
+def test_elbow_pivot_is_announced_only_once_it_is_usable(elbow_app):
+    """Before the elbow is seen we are really using the wrist."""
+    assert elbow_app.effective_pivot == "wrist"
+
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=(0.5, 0.73))
+    assert elbow_app.effective_pivot == "elbow"
+
+
+def test_missing_elbow_falls_back_to_the_wrist(elbow_app):
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=None)
+    assert elbow_app.effective_pivot == "wrist"
+
+
+def test_a_single_dropped_frame_does_not_switch_pivot(elbow_app):
+    """One occluded frame must not teleport the cursor."""
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=(0.5, 0.73))
+    assert elbow_app.effective_pivot == "elbow"
+
+    feed_elbow(elbow_app, pointing_hand(dx=1), None, 5000.0, dt=1 / 30)
+    assert elbow_app.effective_pivot == "elbow"  # still holding the elbow
+
+
+def test_sustained_loss_switches_back_after_a_few_frames(elbow_app):
+    from pnc.app import PIVOT_DROPOUT_FRAMES
+
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=(0.5, 0.73))
+    assert elbow_app.effective_pivot == "elbow"
+
+    now = 5000.0
+    for _ in range(PIVOT_DROPOUT_FRAMES):
+        feed_elbow(elbow_app, pointing_hand(dx=1), None, now, dt=1 / 30)
+        now += 33.3
+    assert elbow_app.effective_pivot == "wrist"
+
+
+def test_pivot_is_frozen_while_a_button_is_held(elbow_app):
+    """Changing the anchor mid-drag would yank the cursor under the user."""
+    settle_elbow(elbow_app, pointing_hand(dx=1, middle_folded=True), elbow=(0.5, 0.73))
+    assert elbow_app.cursor.button_down
+    assert elbow_app.effective_pivot == "elbow"
+
+    # Elbow disappears for many frames mid-hold: still elbow, still no teleport.
+    for offset in range(10):
+        feed_elbow(
+            elbow_app,
+            pointing_hand(dx=1, middle_folded=True),
+            None,
+            5000.0 + offset * 33.3,
+            dt=1 / 30,
+        )
+        assert elbow_app.effective_pivot == "elbow"
+    assert elbow_app.cursor.button_down
+
+
+def test_losing_the_elbow_resets_the_smoother(elbow_app):
+    """Otherwise the filter smears the jump across several frames and the
+    cursor visibly trails behind your hand."""
+    from pnc.app import PIVOT_DROPOUT_FRAMES
+
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=(0.5, 0.73))
+    assert elbow_app.effective_pivot == "elbow"
+
+    elbow_app.smoother._filters["x"]._last = 12345.0  # pretend it has history
+    elbow_app._elbow_miss_run = PIVOT_DROPOUT_FRAMES - 1
+
+    assert elbow_app._update_pivot(None, 5000.0) is None
+    assert elbow_app.effective_pivot == "wrist"
+    assert elbow_app.smoother._filters["x"]._last is None
+
+
+def test_the_first_frame_after_a_dropout_is_not_dragged_by_filter_history(elbow_app):
+    """The user-visible consequence: the cursor must not sweep across the screen
+    on the frame the pivot changes."""
+    from pnc.app import PIVOT_DROPOUT_FRAMES
+
+    settle_elbow(elbow_app, pointing_hand(dx=1), elbow=(0.5, 0.73))
+    settle_elbow(elbow_app, pointing_hand(dx=-1), None, start_ms=5000)
+    # Poison the filter to stand in for a long pre-dropout history.
+    elbow_app.smoother._filters["x"]._last = 12345.0
+    elbow_app._elbow_miss_run = PIVOT_DROPOUT_FRAMES - 1
+
+    before = elbow_app.cursor.position()
+    feed_elbow(elbow_app, pointing_hand(dx=-1), None, 20_000, dt=1 / 30)
+    jump = math.dist(elbow_app.cursor.position(), before)
+
+    # A single frame moves at most a step or two, not a screenful.
+    assert jump < SCREEN_W * 0.25
+
+
+def test_cycling_to_elbow_picks_up_the_elbow_gain(monkeypatch):
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config())
+    instance.preview = False
+    instance._aspect = FRAME_ASPECT
+    instance._refresh_projector(FRAME_ASPECT)
+
+    assert instance.pivot == "wrist"
+    wrist_gain = instance.gain
+
+    instance._cycle_pivot()
+    assert instance.pivot == "elbow"
+    assert instance.gain == pytest.approx(instance.cfg.aim.gain_elbow)
+    assert instance.gain < wrist_gain
+
+    instance._cycle_pivot()
+    assert instance.pivot == "wrist"
+    assert instance.gain == pytest.approx(wrist_gain)
+
+
+def test_an_explicit_gain_survives_a_pivot_change(monkeypatch):
+    """--gain is a deliberate override, so switching pivot must not clobber it."""
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config(), gain=0.42)
+    instance.preview = False
+    instance._aspect = FRAME_ASPECT
+    instance._refresh_projector(FRAME_ASPECT)
+
+    instance._cycle_pivot()
+    assert instance.pivot == "elbow"
+    assert instance.gain == pytest.approx(0.42)
+
+
+def test_cycling_pivot_while_pressed_releases_the_button(monkeypatch):
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    instance = app_module.App(Config())
+    instance.preview = False
+    instance._aspect = FRAME_ASPECT
+    instance._refresh_projector(FRAME_ASPECT)
+    instance.fsm.max_hold_ms = 60_000
+
+    settled(instance, pointing_hand(dx=1, middle_folded=True))
+    assert instance.cursor.button_down
+
+    instance._cycle_pivot()
+    assert not instance.cursor.button_down
+
+
+def test_unknown_pivot_is_rejected(monkeypatch):
+    from pnc import app as app_module
+
+    monkeypatch.setattr(app_module, "Cursor", FakeCursor)
+    with pytest.raises(ValueError):
+        app_module.App(Config(pivot="nose"))

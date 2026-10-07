@@ -58,6 +58,23 @@ def draw_hand(frame, points, connections, highlight: set | None = None) -> None:
     cv2.line(frame, (tip[0], tip[1] - size), (tip[0], tip[1] + size), _YELLOW, 1, cv2.LINE_AA)
 
 
+def draw_pivot_axis(frame, points, elbow=None, using_elbow: bool = False) -> None:
+    """The ray the cursor follows: pivot -> index tip.
+
+    Seeing this makes the pivot choice concrete - with the elbow in use the ray
+    visibly swings as you rotate your forearm, which the wrist pivot ignores.
+    """
+    height, width = frame.shape[:2]
+    pivot = elbow if (using_elbow and elbow is not None) else points[L.WRIST]
+    tip = points[L.INDEX_TIP]
+
+    colour = _MAGENTA if using_elbow else _GREY
+    start = _px(pivot, width, height)
+    end = _px(tip, width, height)
+    cv2.line(frame, start, end, colour, 1, cv2.LINE_AA)
+    cv2.circle(frame, start, 5, colour, 2, cv2.LINE_AA)
+
+
 def draw_pinch_gauge(frame, points, closed: bool) -> None:
     """The thumb-to-index gap that pinch clicking reads, drawn as a bar."""
     height, width = frame.shape[:2]

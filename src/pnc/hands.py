@@ -6,7 +6,22 @@ MediaPipe is imported lazily inside the class so that the pure-logic modules
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass
+class Hand:
+    """One detected hand, carrying the handedness needed to pick the right elbow."""
+
+    landmarks: list
+    handedness: str | None = None
+    """MediaPipe's label for the tracked hand, or None if it is unsure."""
+    score: float = 0.0
+
+    def __len__(self) -> int:
+        return len(self.landmarks)
 
 
 class HandTracker:
@@ -39,8 +54,8 @@ class HandTracker:
         self._landmarker = HandLandmarker.create_from_options(options)
         self._last_ts_ms = -1
 
-    def detect(self, rgb_frame: np.ndarray, timestamp_ms: int):
-        """Detect hands in a BGR->RGB frame. Returns a list of 21-point lists.
+    def detect(self, rgb_frame: np.ndarray, timestamp_ms: int) -> list[Hand]:
+        """Detect hands in a BGR->RGB frame. Returns a list of :class:`Hand`.
 
         Each landmark is ``(x, y)`` normalised to the frame, so resolution
         changes do not affect any downstream maths.
@@ -56,9 +71,19 @@ class HandTracker:
         )
         result = self._landmarker.detect_for_video(image, timestamp_ms)
 
-        hands = []
-        for hand in result.hand_landmarks:
-            hands.append([(float(lm.x), float(lm.y)) for lm in hand])
+        hands: list[Hand] = []
+        for index, landmarks in enumerate(result.hand_landmarks):
+            handedness, score = None, 0.0
+            if index < len(result.handedness) and result.handedness[index]:
+                best = max(result.handedness[index], key=lambda c: c.score)
+                handedness, score = best.category_name, best.score
+            hands.append(
+                Hand(
+                    landmarks=[(float(lm.x), float(lm.y)) for lm in landmarks],
+                    handedness=handedness,
+                    score=float(score),
+                )
+            )
         return hands
 
     def close(self) -> None:

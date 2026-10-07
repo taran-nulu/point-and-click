@@ -3,7 +3,7 @@
 The pipeline is:
 
     landmarks (normalised image coords)
-      -> aim_target()          wrist-anchored, depth-invariant pointing ray
+      -> aim_target()          the pointing model, pivoting about a chosen anchor
       -> to_screen_space()     aspect-corrected "camera space"
       -> Projector.__call__   calibrated homography, or a default fit
       -> screen points in Quartz coordinates
@@ -13,6 +13,26 @@ Why the middle step exists: the camera frame is 4:3 and the screen is roughly
 the mapping by ~15%, which shows up as the cursor travelling faster
 horizontally than vertically. Correcting for aspect first keeps the geometry
 honest, and any residual error is absorbed by the calibration homography.
+
+Pivot points
+------------
+The fingertip is projected along a ray anchored at some pivot point. Which one
+you anchor at decides what motion moves the cursor:
+
+``wrist``
+    Rotating your wrist aims. The forearm barely contributes, because rotating
+    your forearm about the elbow hardly moves your wrist.
+
+``elbow``
+    Rotating your forearm aims, which is a larger and more comfortable range of
+    motion than wrist rotation. The lever is ~2.4x longer (elbow-to-fingertip
+    ~44 cm against wrist-to-fingertip ~18 cm), so an elbow pivot needs a
+    proportionally smaller ``gain`` for the same cursor sensitivity - otherwise
+    every movement is exaggerated and the cursor shakes.
+
+Note that at *matched* sensitivity the two reach about as far. The elbow buys
+ergonomics, not range; range comes from ``gain`` and calibration, which trade
+against jitter.
 """
 
 from __future__ import annotations
@@ -22,6 +42,10 @@ import math
 import numpy as np
 
 from . import landmarks as L
+
+PIVOT_WRIST = "wrist"
+PIVOT_ELBOW = "elbow"
+PIVOT_NAMES = (PIVOT_WRIST, PIVOT_ELBOW)
 
 
 def hand_scale(pts) -> float:
@@ -35,13 +59,25 @@ def hand_scale(pts) -> float:
     return math.dist(pts[L.WRIST], pts[L.MIDDLE_MCP])
 
 
-def aim_target(pts, gain: float, min_scale: float = 0.015):
-    """The wrist-anchored pointing model.
+def pivot_point(pts, pivot: str = PIVOT_WRIST, elbow=None):
+    """The anchor the pointing ray radiates from.
+
+    Always returns the wrist when the requested pivot is unavailable, so the
+    fallback to a wrist pivot is structural rather than a special case that
+    every caller has to remember to handle.
+    """
+    if pivot == PIVOT_ELBOW and elbow is not None:
+        return elbow
+    return pts[L.WRIST]
+
+
+def aim_target(pts, gain: float, min_scale: float = 0.015, pivot: str = PIVOT_WRIST, elbow=None):
+    """The pointing model.
 
     Places the index fingertip at a *fixed distance from the camera*, measured
-    in units of hand size and anchored at the wrist::
+    in units of hand size, anchored at the pivot::
 
-        u = wrist + (index_tip - wrist) * (gain / scale)
+        u = anchor + (index_tip - anchor) * (gain / scale)
 
     The returned point is in normalised image coordinates and is deliberately
     **not** clamped to [0, 1]: the gain is what lets you reach the screen
@@ -54,9 +90,9 @@ def aim_target(pts, gain: float, min_scale: float = 0.015):
         return None
 
     k = gain / scale
-    wx, wy = pts[L.WRIST]
+    ax, ay = pivot_point(pts, pivot, elbow)
     tx, ty = pts[L.INDEX_TIP]
-    return (wx + (tx - wx) * k, wy + (ty - wy) * k)
+    return (ax + (tx - ax) * k, ay + (ty - ay) * k)
 
 
 def to_screen_space(u: float, v: float, aspect: float) -> tuple[float, float]:

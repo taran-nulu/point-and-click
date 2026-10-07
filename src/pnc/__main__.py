@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("middle-finger", "pinch"),
         help="how to click: fold the middle finger, or pinch thumb to index",
     )
+    run.add_argument(
+        "--pivot",
+        choices=("wrist", "elbow"),
+        help="what the pointer pivots about: your wrist, or your elbow",
+    )
 
     calibrate = sub.add_parser("calibrate", help="interactive five-target calibration")
     calibrate.add_argument("--camera", type=int, help="camera index (default 0)")
@@ -89,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             video_path=args.from_video,
             recalibrate=args.recalibrate,
             click_method=args.click_method,
+            pivot=args.pivot,
         )
 
     try:

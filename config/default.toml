@@ -5,6 +5,16 @@
 # Overridden by the --click-method flag on `pnc run`.
 click_method = "middle-finger"
 
+# What the pointing ray pivots about: "wrist" or "elbow".
+# Overridden by the --pivot flag on `pnc run`.
+#
+# "elbow" means rotating your forearm aims, instead of rotating your wrist.
+# It loads a second model to find your elbow (+5.8 MB, +8 ms inference, which
+# currently still fits inside the frame budget), and it needs a wider view -
+# your arm has to be in frame. If your arm drops out of frame it falls back to
+# the wrist automatically.
+pivot = "wrist"
+
 [camera]
 index = 0          # 0 is the built-in MacBook camera
 width = 640
@@ -29,6 +39,33 @@ mirror = true      # flip x once at input so "my right" == "cursor right"
 # Press +/- while running to tune live, then put the value here to keep it.
 # See README.md.
 gain = 0.5
+
+# The same setting when pivoting from your elbow. The elbow-to-fingertip lever
+# is ~2.4x the wrist-to-fingertip one, so at the same gain the cursor would
+# swing ~2.5x further for the same forearm rotation - every motion exaggerated
+# and every wobble amplified. gain / 2.5 lands here.
+#
+# This is a starting point, not a law: your arm proportions and how you move
+# decide the right value. Use +/- with --pivot elbow to find it.
+gain_elbow = 0.2
+
+[arm]
+# Used by the "elbow" pivot only.
+
+# Pose confidence required before an elbow is trusted. If your shoulders leave
+# the frame, MediaPipe keeps *emitting* elbow coordinates that no longer mean
+# anything, and a long lever amplifies that into a wild jump. Raising this
+# makes the fallback to the wrist happen sooner; lowering it risks trusting a
+# bad fix.
+min_visibility = 0.5
+
+# Which elbow to use: "auto" (follows the hand tracker's handedness), or force
+# "left"/"right". The override exists for the case where auto picks the wrong
+# arm because of how the mirrored frame reads.
+side = "auto"
+
+# Pose model size: lite (~5.8 MB), full, or heavy.
+model = "lite"
 
 median_window = 3  # landmark outlier rejection; 1 disables
 min_cutoff = 1.2   # 1 Euro filter. Lower = smoother but laggier.

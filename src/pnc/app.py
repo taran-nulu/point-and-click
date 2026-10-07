@@ -20,13 +20,17 @@ import numpy as np
 
 from . import calibration as calib
 from . import gestures, overlay
+from .arm import ArmTracker
 from .camera import Camera, VideoSource
-from .config import CALIB_PATH, Config, ensure_model
+from .config import CALIB_PATH, Config, ensure_model, ensure_pose_model
 from .controls import InputGuard
 from .cursor import Cursor
 from .filters import CursorSmoother
 from .hands import HandTracker, connections
 from .mapper import (
+    PIVOT_ELBOW,
+    PIVOT_NAMES,
+    PIVOT_WRIST,
     DefaultProjector,
     aim_target,
     clamp_to_display,
@@ -40,7 +44,10 @@ TRACKING = "TRACKING"
 CLICKING = "CLICKING"
 PAUSED = "PAUSED"
 
-_HELP = "q quit | c calibrate | m pause | p preview | +/- gain | x click method"
+_HELP = "q quit | c calibrate | m pause | p preview | b pivot | x click | +/- gain"
+
+# Consecutive frames without a usable elbow before falling back to the wrist.
+PIVOT_DROPOUT_FRAMES = 3
 
 
 def _now_ms() -> float:
@@ -57,12 +64,13 @@ class App:
         video_path: str | None = None,
         recalibrate: bool = False,
         click_method: str | None = None,
+        pivot: str | None = None,
     ) -> None:
         self.cfg = cfg
-        self.gain = cfg.aim.gain if gain is None else gain
         self.preview = cfg.preview.enabled if preview is None else preview
         self.video_path = video_path
         self.calib_path = CALIB_PATH
+        self._gain_override = gain
 
         self.cursor = Cursor(display_index)
         self.smoother = CursorSmoother(
@@ -76,12 +84,25 @@ class App:
         self.fsm = gestures.ClickFSM.for_method(self.click_method, cfg)
         self.guard = InputGuard()
 
+        self.pivot = pivot or cfg.pivot
+        if self.pivot not in PIVOT_NAMES:
+            raise ValueError(
+                f"Unknown pivot {self.pivot!r}. Choose from {sorted(PIVOT_NAMES)}."
+            )
+        self._aspect = 4.0 / 3.0
         self.matrix = calib.load(self.calib_path)
         self.projector = None
-        self.calib_was_warned = False
+        # _apply_pivot derives the gain for the chosen pivot and touches the
+        # projector, so it has to run after those two exist.
+        self._apply_pivot()
+        self.arm: ArmTracker | None = None
+
         self.running = True
         self.start_calibration = recalibrate
         self._click_anchor: tuple[float, float] | None = None
+        self._elbow_live = False
+        self._elbow_miss_run = 0
+        self._elbow_used = None
 
         self._lost_since: float | None = None
         self._hand_seen_since: float | None = None
@@ -128,9 +149,15 @@ class App:
         x0, y0, w, h = self.cursor.bounds
         self.projector = load_projector(aspect, w, h, self.matrix)
 
-    def _map_to_screen(self, points, now_ms: float, dt: float | None):
+    def _map_to_screen(self, points, now_ms: float, dt: float | None, elbow=None):
         """Fingertips -> smoothed screen point, or ``None`` if unmeasurable."""
-        target = aim_target(points, self.gain, self.cfg.aim.min_scale)
+        target = aim_target(
+            points,
+            self.gain,
+            self.cfg.aim.min_scale,
+            pivot=self.effective_pivot,
+            elbow=elbow,
+        )
         if target is None:
             return None, None
 
@@ -169,6 +196,8 @@ class App:
             self._notify(f"gain {self.gain:.2f}", _now_ms())
         elif key in (ord("x"), ord("X")):
             self._cycle_click_method()
+        elif key in (ord("b"), ord("B")):
+            self._cycle_pivot()
         return True
 
     def _cycle_click_method(self) -> None:
@@ -212,13 +241,17 @@ class App:
             if self.preview:
                 view = overlay.Overlay(self.cfg.preview.window)
 
+            # The pose model only loads if the elbow pivot is actually in use,
+            # so the default path stays a single model and 30 fps.
+            arm = self._maybe_open_arm()
+
             if self.start_calibration:
                 # Calibration needs the preview: it is the feedback loop that
                 # tells you when you are pointing at the right place.
                 if view is None:
                     self.preview = True
                     view = overlay.Overlay(self.cfg.preview.window)
-                self.calibrate(source, tracker, connections_list, view)
+                self.calibrate(source, tracker, connections_list, view, arm)
                 self.start_calibration = False
 
             if self.matrix is None:
@@ -226,6 +259,7 @@ class App:
                 print("Run `pnc calibrate` (or press c in the preview) to teach it where you point.")
             else:
                 print(f"Calibration loaded from {self.calib_path}")
+            self._warn_calibration_pivot()
 
             last_frame_ms = _now_ms()
             while self.running:
@@ -255,20 +289,31 @@ class App:
                 dt = (now - self._last_ts) / 1000.0 if self._last_ts else None
                 self._last_ts = now
 
-                points = hands[0] if hands else None
+                hand = hands[0] if hands else None
+                points = hand.landmarks if hand is not None else None
+
+                # Pose must run on the same pixels, so its coordinates line up
+                # with the hand landmarks.
+                elbow = None
+                if arm is not None:
+                    elbow = arm.elbow(
+                        rgb, int(now), hand.handedness if hand is not None else None
+                    )
 
                 if self.start_calibration:
-                    self.calibrate(source, tracker, connections_list, view)
+                    self.calibrate(source, tracker, connections_list, view, arm)
                     self.start_calibration = False
                     continue
 
-                self._step(points, now, dt, frame, connections_list, view)
+                self._step(points, now, dt, frame, connections_list, view, elbow)
 
                 if self.preview and view is not None:
                     view.show(frame)
                     if not self._handle_key(view.poll_key()):
                         break
 
+            if arm is not None:
+                arm.close()
             if self.preview and view is not None:
                 view.close()
 
@@ -276,9 +321,126 @@ class App:
         self._restore_signal_handlers()
         return 0
 
+    def _maybe_open_arm(self) -> ArmTracker | None:
+        """Load the pose model only if the elbow pivot is selected."""
+        if self.pivot != PIVOT_ELBOW:
+            return None
+        try:
+            model = ensure_pose_model(self.cfg.arm.model)
+            return ArmTracker(
+                model,
+                min_visibility=self.cfg.arm.min_visibility,
+                side=self.cfg.arm.side,
+            )
+        except (RuntimeError, Exception) as exc:  # noqa: BLE001 - degrade, never die
+            print(f"! Could not start arm tracking ({exc}); falling back to the wrist pivot.")
+            self.pivot = PIVOT_WRIST
+            self._apply_pivot()
+            return None
+
+    def _warn_calibration_pivot(self) -> None:
+        """A homography fitted to one pivot is wrong for the other."""
+        meta = calib.load_meta(self.calib_path)
+        fitted = meta.get("pivot")
+        if fitted is None or fitted == self.pivot:
+            return
+        print()
+        print(f"! Calibration was fitted for the {fitted} pivot, but you are running")
+        print(f"  the {self.pivot} pivot. The mapping will be off until you recalibrate:")
+        print("    pnc calibrate")
+        print()
+
+    # ------------------------------------------------------------------- pivot
+
+    def _update_pivot(self, elbow, now: float):
+        """Decide whether to aim from the elbow this frame.
+
+        Returns the elbow to aim from, or ``None`` to fall back to the wrist.
+
+        The awkward part is that changing the anchor *teleports the cursor*,
+        because the anchor is an additive term in the projection. Losing your
+        arm mid-drag would yank the cursor under the user's finger, so:
+
+        - while a button is held, the choice is frozen at whatever it was when
+          the press began;
+        - dropping out takes several consecutive misses, so a single occluded
+          frame does not switch you over;
+        - switching resets the smoother, which would otherwise smear the jump
+          across several frames and leave the cursor visibly trailing.
+        """
+        if self.pivot != PIVOT_ELBOW:
+            self._elbow_miss_run = 0
+            self._elbow_live = False
+            return None
+
+        if self.fsm.pressed:
+            # Hold the anchor steady for the duration of the click.
+            return elbow if self._elbow_live else None
+
+        if elbow is not None:
+            self._elbow_miss_run = 0
+            if not self._elbow_live:
+                self._elbow_live = True
+                self.smoother.reset()
+                self._notify("aiming from your elbow", now)
+            return elbow
+
+        self._elbow_miss_run += 1
+        if self._elbow_live and self._elbow_miss_run >= PIVOT_DROPOUT_FRAMES:
+            self._elbow_live = False
+            self.smoother.reset()
+            self._notify("arm not visible - aiming from your wrist", now)
+        return None
+
+    @property
+    def effective_pivot(self) -> str:
+        """The pivot in force right now, which may differ from the request."""
+        if self.pivot == PIVOT_ELBOW and self._elbow_live:
+            return PIVOT_ELBOW
+        return PIVOT_WRIST
+
+    def _apply_pivot(self, pivot: str | None = None) -> None:
+        """Switch pivot mode, or just re-derive state if ``pivot`` is None."""
+        if pivot is not None:
+            self.pivot = pivot
+        self._elbow_live = False
+        self._elbow_miss_run = 0
+        self.smoother.reset()
+
+        default_gain = (
+            self.cfg.aim.gain_elbow
+            if self.pivot == PIVOT_ELBOW
+            else self.cfg.aim.gain
+        )
+        # An explicit --gain is a deliberate override and survives the switch.
+        self.gain = default_gain if self._gain_override is None else self._gain_override
+
+        if self.projector is not None:
+            self._refresh_projector(self._aspect)
+
+    def _cycle_pivot(self) -> None:
+        """Toggle between wrist and elbow, live.
+
+        Safe to do mid-click: the button is released first, because the two
+        pivots are different mappings and continuing a drag across that change
+        would fling the cursor.
+        """
+        if self.cursor.button_down:
+            self.cursor.release()
+        self.fsm.force_release()
+        self._click_anchor = None
+
+        nxt = PIVOT_WRIST if self.pivot == PIVOT_ELBOW else PIVOT_ELBOW
+        self._apply_pivot(nxt)
+
+        if nxt == PIVOT_ELBOW:
+            self._notify("pivot: elbow (needs the pose model)", _now_ms())
+        else:
+            self._notify(f"pivot: wrist (gain {self.gain:.2f})", _now_ms())
+
     # ------------------------------------------------------------------- step
 
-    def _step(self, points, now: float, dt, frame, connections_list, view) -> None:
+    def _step(self, points, now: float, dt, frame, connections_list, view, elbow=None) -> None:
         # 1. Has the real mouse been used? Check before we overwrite it.
         if self.guard.detect(self.cursor, now):
             if self.cursor.button_down:
@@ -312,9 +474,12 @@ class App:
         else:
             self._lost_since = None
 
+        # 2. Which pivot are we actually using this frame?
+        self._elbow_used = self._update_pivot(elbow, now)
+
         screen_point, aim_point = (None, None)
         if has_hand:
-            screen_point, aim_point = self._map_to_screen(points, now, dt)
+            screen_point, aim_point = self._map_to_screen(points, now, dt, self._elbow_used)
             if screen_point is None:
                 has_hand = False
 
@@ -364,6 +529,8 @@ class App:
             if aim_point is not None:
                 overlay.draw_aim_point(frame, aim_point)
             overlay.draw_minimap(frame, self.cursor.bounds, self.cursor.position())
+            if self.pivot == PIVOT_ELBOW:
+                overlay.draw_pivot_axis(frame, points, self._elbow_used, self._elbow_live)
 
         if self.fsm.pressed:
             state, colour = CLICKING, overlay._RED
@@ -377,9 +544,18 @@ class App:
         signal = method.signal(points) if has_hand else None
         signal_text = f"{signal:.2f}" if signal is not None else "--"
 
+        if self.pivot == PIVOT_ELBOW:
+            if self._elbow_live:
+                pivot_text, pivot_colour = "elbow", overlay._GREEN
+            else:
+                pivot_text, pivot_colour = "wrist (arm not visible)", overlay._YELLOW
+        else:
+            pivot_text, pivot_colour = "wrist", overlay._WHITE
+
         lines = [
             (f"{self._fps:4.0f} fps", overlay._WHITE),
             (f"state {state}", colour),
+            (f"pivot {pivot_text}", pivot_colour),
             (f"gain {self.gain:.2f}", overlay._WHITE),
             (f"click {method.label} {signal_text}", overlay._WHITE),
         ]
@@ -403,7 +579,7 @@ class App:
 
     # ----------------------------------------------------------- calibration
 
-    def calibrate(self, source, tracker: HandTracker, connections_list, view) -> None:
+    def calibrate(self, source, tracker: HandTracker, connections_list, view, arm=None) -> None:
         """Interactive five-target calibration."""
         self._refresh_projector(source.actual_size[0] / source.actual_size[1])
         default_projector = DefaultProjector(
@@ -427,6 +603,7 @@ class App:
         print()
 
         samples: dict[str, tuple[float, float]] = {}
+        sample_pivots: dict[str, str] = {}
         tolerance = 26.0  # pixels in the preview
         hold_ms = 350.0
 
@@ -453,16 +630,35 @@ class App:
                 self._refresh_projector(aspect)
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                hands = tracker.detect(rgb, int(_now_ms()))
+                stamp = int(_now_ms())
+                hands = tracker.detect(rgb, stamp)
                 now = _now_ms()
-                points = hands[0] if hands else None
+                hand = hands[0] if hands else None
+                points = hand.landmarks if hand is not None else None
+
+                # Calibrate against the same pivot that will be used at runtime,
+                # or the fitted mapping describes a different geometry.
+                elbow = None
+                if arm is not None:
+                    elbow = arm.elbow(
+                        rgb, stamp, hand.handedness if hand is not None else None
+                    )
+                self._elbow_used = elbow
+                pivot = PIVOT_ELBOW if elbow is not None else PIVOT_WRIST
 
                 overlay.draw_target_ring(frame, target_uv, overlay._CYAN, f"point at the {name}")
 
                 distance = None
                 if points is not None:
                     overlay.draw_hand(frame, points, connections_list)
-                    aim_point = aim_target(points, self.gain, self.cfg.aim.min_scale)
+                    overlay.draw_pivot_axis(frame, points, elbow, elbow is not None)
+                    aim_point = aim_target(
+                        points,
+                        self.gain,
+                        self.cfg.aim.min_scale,
+                        pivot=pivot,
+                        elbow=elbow,
+                    )
                     if aim_point is not None:
                         overlay.draw_aim_point(frame, aim_point)
                         distance = float(np.hypot(
@@ -500,12 +696,23 @@ class App:
 
             # Average a short burst so a single noisy frame does not define a corner.
             samples[name] = best
+            sample_pivots[name] = pivot
             print(f"    captured {name}")
 
         if len(samples) < len(calib.CORNER_NAMES):
             print()
             print("Calibration incomplete - keeping the previous mapping.")
             return
+
+        # Mixing pivots would fit a mapping describing a geometry that never
+        # exists, so refuse rather than save something subtly wrong.
+        used_pivots = {sample_pivots[n] for n in samples}
+        if len(used_pivots) > 1:
+            print()
+            print("Calibration mixed wrist and elbow pivots (your arm came in and out")
+            print("of frame). Run it again and keep your arm visible throughout.")
+            return
+        fitted_pivot = used_pivots.pop()
 
         try:
             matrix = calib.build_homography(samples, origin, size)
@@ -520,6 +727,7 @@ class App:
             meta={
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "gain": self.gain,
+                "pivot": fitted_pivot,
                 "display_origin": list(origin),
                 "display_size": list(size),
                 "centre_error_points": error_px,

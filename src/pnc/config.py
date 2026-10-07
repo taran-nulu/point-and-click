@@ -23,6 +23,11 @@ MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 
+_POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "{variant}/float16/1/{variant}.task"
+)
+
 
 @dataclass
 class CameraConfig:
@@ -72,6 +77,19 @@ class AimConfig:
     """
     min_scale: float = 0.015
     """Below this hand size the depth division is unsafe (practically never)."""
+
+    gain_elbow: float = 0.2
+    """``gain`` to use when pivoting from the elbow.
+
+    The elbow-to-fingertip lever is roughly 2.4x the wrist-to-fingertip one
+    (44 cm against 18 cm), so the same ``gain`` would move the cursor ~2.4x
+    further for the same forearm rotation - every motion exaggerated, every
+    wobble amplified. 0.5 / 2.4 lands at ~0.2, which is the setting that keeps
+    an elbow pivot feeling like the wrist pivot did.
+
+    Note this buys *ergonomics*, not range: at matched sensitivity both pivots
+    reach about equally far.
+    """
     median_window: int = 3
     """Landmark outlier rejection. 1 disables it."""
     min_cutoff: float = 1.2
@@ -111,6 +129,24 @@ class PinchConfig:
 
 
 @dataclass
+class ArmConfig:
+    """Elbow detection for the ``elbow`` pivot."""
+
+    min_visibility: float = 0.5
+    """Pose confidence required to trust the elbow.
+
+    If your upper body leaves the frame, MediaPipe keeps *emitting* elbow
+    coordinates - they just stop meaning anything. Gating on its own visibility
+    score is what stops a confidently-wrong elbow from being amplified through a
+    long lever arm into a wild cursor jump.
+    """
+    side: str = "auto"
+    """Which elbow: "auto" (from the hand tracker's handedness), "left", "right"."""
+    model: str = "lite"
+    """Pose model size. lite is ~5.8 MB and plenty for an elbow."""
+
+
+@dataclass
 class SafetyConfig:
     hand_lost_release_ms: int = 250
     """Drop the cursor and release any button this soon after losing the hand."""
@@ -130,6 +166,7 @@ class Config:
     aim: AimConfig = field(default_factory=AimConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
     pinch: PinchConfig = field(default_factory=PinchConfig)
+    arm: ArmConfig = field(default_factory=ArmConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
 
@@ -138,6 +175,12 @@ class Config:
 
     Overridden by ``--click-method``; here so the default can live in the config
     file alongside the thresholds it selects between.
+    """
+
+    pivot: str = "wrist"
+    """What the pointing ray pivots about: "wrist" or "elbow".
+
+    Overridden by ``--pivot``.
     """
 
 
@@ -169,6 +212,10 @@ def load_config(path: str | Path | None = None) -> Config:
 
 def model_path() -> Path:
     return MODELS_DIR / MODEL_FILENAME
+
+
+def pose_model_path(variant: str = "lite") -> Path:
+    return MODELS_DIR / f"pose_landmarker_{variant}.task"
 
 
 def _download(url: str, destination) -> None:
@@ -211,6 +258,28 @@ def ensure_model() -> Path:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
             f"Could not download the model from {MODEL_URL}: {exc}\n"
+            f"Download it manually and save it to {target}."
+        ) from exc
+    tmp.replace(target)
+    return target
+
+
+def ensure_pose_model(variant: str = "lite") -> Path:
+    """The pose model is only needed for the elbow pivot, so it downloads lazily."""
+    target = pose_model_path(variant)
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    url = _POSE_MODEL_URL.format(variant=f"pose_landmarker_{variant}")
+    tmp = target.with_suffix(".part")
+    print(f"==> downloading pose landmarker model to {target}")
+    try:
+        _download(url, tmp)
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim, it is actionable
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Could not download the pose model from {url}: {exc}\n"
             f"Download it manually and save it to {target}."
         ) from exc
     tmp.replace(target)
