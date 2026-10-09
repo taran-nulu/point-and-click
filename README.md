@@ -10,15 +10,27 @@ Two things are configurable, because which feels best is personal:
 | | Options | Flag |
 |---|---|---|
 | **How to click** | `middle-finger` (default, supports drag), `pinch` | `--click-method` |
-| **What to pivot about** | `wrist` (default), `elbow` | `--pivot` |
+| **What to pivot about** | `wrist` (default), `elbow` *(does not work well — see below)* | `--pivot` |
+
+> ### ⚠️ The elbow pivot does not work well
+>
+> `--pivot elbow` is **known to perform poorly in practice.** It was built on a
+> sound geometric argument and it does everything it was designed to do
+> mechanically — the measurements back that up — but in the hand it feels
+> jittery and imprecise. **Use the default `wrist` pivot.** Treat `elbow` as an
+> experiment that did not pan out, not as a usable option.
+>
+> If you want to try it anyway, `b` switches pivots live so you can compare
+> without restarting. The reasoning behind it, and the most likely reason it
+> fails, are in [Why the elbow pivot underperforms](#why-the-elbow-pivot-underperforms).
 
 ```bash
 ./run.sh doctor              # check camera, permissions, throughput
 ./run.sh doctor --gestures   # measure your click gesture thresholds
 ./run.sh calibrate           # teach it where you point
 ./run.sh run                                  # wrist pivot, middle-finger click
-./run.sh run --pivot elbow                    # aim by rotating your forearm
-./run.sh run --pivot elbow --click-method pinch
+./run.sh run --click-method pinch             # pinch click
+./run.sh run --pivot elbow                    # experimental, see the warning above
 ```
 
 `run.sh` creates a virtualenv and installs everything on first run. Requires
@@ -64,7 +76,9 @@ responding. Wrist pivot uses **0.5**.
 
 ### 2. Pivot point: wrist or elbow
 
-This decides *what motion moves the cursor*.
+**In practice the elbow pivot performs poorly and you should leave it alone.**
+What follows is the design as built, kept because it explains why the elbow was
+expected to help — and [why it doesn't](#why-the-elbow-pivot-underperforms).
 
 - **`wrist`** — rotating your wrist aims. Your forearm barely contributes,
   because rotating it about the elbow hardly moves your wrist.
@@ -87,34 +101,28 @@ for the same 20° forearm rotation**, which is why `gain_elbow` is set to
 `0.5 / 2.5 ≈ 0.2` — the value that makes an elbow pivot feel like the wrist
 pivot did. `tests/test_pivot.py` pins that relationship down.
 
+Every one of those numbers is correct, and the feature still does not work well.
+See [Why the elbow pivot underperforms](#why-the-elbow-pivot-underperforms).
+
 **What the elbow pivot does not do is give you more reach.** Reach comes from
-`gain` and calibration, and both trade against jitter. The elbow buys
-ergonomics, not range.
+`gain` and calibration, and both trade against jitter. The elbow was meant to
+buy ergonomics, not range.
 
-Elbow pivoting needs a second model, since MediaPipe's hand landmarker has no
-arm landmarks:
+Implementation notes, for anyone maintaining it rather than using it:
 
-- **Cost:** a 5.8 MB pose model, downloaded automatically on first use, and
-  ~8 ms more inference per frame. On this machine that costs **no framerate at
-  all** — the camera tops out around 33 fps and hand+pose inference (~20 ms)
-  still fits inside the budget. It is close to the limit though: on a slower
-  machine, or at a higher resolution, the extra inference would start to bite.
-- **Your arm has to be in frame.** Pose landmarks carry a visibility score, and
-  the elbow is only trusted above `arm.min_visibility`. MediaPipe will happily
-  keep *emitting* elbow coordinates when your shoulders are out of frame — they
-  just stop meaning anything, and a long lever amplifies that into a wild jump.
-  Below the threshold it reports nothing and the tool falls back to the wrist.
-- **The fallback is never silent.** The HUD shows `pivot elbow` or
-  `pivot wrist (arm not visible)`, and the preview draws the pivot→fingertip ray
-  so you can see which is in use.
-
-Switching pivot mid-drag would teleport the cursor, because the pivot is an
-additive term. So while a button is held the choice is frozen, dropout takes
-several consecutive frames to trigger, and the smoother resets on a switch.
-
-If a homography was fitted under one pivot, it is wrong for the other — the
-calibration records which pivot it used and `run` warns you to recalibrate.
-Mixing pivots *within* one calibration is refused outright.
+- Elbow tracking needs a second model, since MediaPipe's hand landmarker has no
+  arm landmarks: a 5.8 MB pose model downloaded on first use, plus ~8 ms
+  inference. That cost **no framerate** on this machine — the camera tops out
+  near 33 fps and hand+pose inference (~20 ms) still fits the budget.
+- The elbow is only trusted above `arm.min_visibility`. MediaPipe keeps
+  *emitting* elbow coordinates when your shoulders are out of frame, where they
+  stop meaning anything; below the threshold it reports nothing and the tool
+  falls back to the wrist. The HUD shows which pivot is live.
+- Switching pivot mid-drag would teleport the cursor, so while a button is held
+  the choice is frozen, dropout takes several consecutive frames, and the
+  smoother resets on a switch.
+- Calibration records which pivot it was fitted under and `run` warns on a
+  mismatch. Mixing pivots within one calibration is refused.
 
 ### 3. Calibration
 
@@ -133,8 +141,55 @@ account for that.
 
 **Calibration is the fix for not being able to reach the screen corners.** The
 uncalibrated mapping preserves the camera's field of view; the homography
-instead stretches whatever range you actually use to fill the screen. Run it
-before reaching for `--pivot elbow` — it may make that unnecessary.
+instead stretches whatever range you actually use to fill the screen. If corner
+reach is your problem, calibrate and raise `gain` — that is what those two are
+for. The elbow pivot cannot help with it.
+
+## Why the elbow pivot underperforms
+
+This is the section to read before spending time on `--pivot elbow`. The
+short version: **the elbow pivot amplifies a motion the camera can barely see.**
+
+The elbow pivot's only advantage over the wrist pivot is that it responds more
+to forearm rotation — that was the entire point, since wrist rotation is a small
+and uncomfortable range of motion. That advantage is real in the geometry, and
+`tests/test_pivot.py` measures it: ~2.5× the cursor travel for the same 20° of
+forearm rotation.
+
+The problem is what happens between that ideal and a webcam pointed at you from
+the top of a screen:
+
+1. **The amplified motion is foreshortened.** Pointing at a screen means your
+   forearm points roughly *at the camera*. Rotation around the elbow is then
+   mostly a rotation about the viewing axis, which projects onto the image as
+   very little movement. So the 4.6× lever is multiplying a signal that is
+   already small — and the errors along with it.
+2. **The lever amplifies noise, not just motion.** `tip − elbow` is a long
+   vector, so any error in the estimated elbow position is scaled up by it. The
+   hand landmarker tracks fingertips on a high-contrast object a few centimetres
+   from the lens; MediaPipe's pose estimate of an elbow, partly occluded by your
+   own torso and often at the frame edge, is much worse. The gain that makes the
+   useful signal bigger makes the estimation noise bigger too.
+3. **Those two compound.** More gain to compensate for a weak signal also
+   amplifies a noisy anchor, so the net result is a cursor that drifts and
+   twitches rather than one that aims confidently.
+
+There is also a plain mismatch of intent: the elbow pivot was reached for to fix
+*reach*, and it cannot fix reach at all. Reach comes from `gain` and
+calibration. The elbow pivot could never have solved the problem it was added
+for.
+
+**To be clear about confidence:** items 1–3 are an explanation consistent with
+the observed behaviour and with the geometry, not a diagnosis measured from your
+hand. I have no instrumented recording of the failure. But the empirical result
+is the thing to act on, and it is unambiguous: keep `pivot = "wrist"`.
+
+If the elbow pivot is ever to be rescued rather than abandoned, the direction is
+to stop amplifying the raw elbow and instead **estimate the forearm axis
+directly** — fit a line through elbow, wrist and index tip and pivot about a
+*damped* point on it, with the damping on your arm's actual motion. That trades
+some of the ergonomic benefit for far less noise amplification. That work has
+not been done.
 
 ## Clicking
 
@@ -238,9 +293,11 @@ driven by synthetic landmarks against a fake cursor.
   whole hand as a pointer, it will not track that.
 - **Pinch cannot drag**, by design — latching is what stops the cursor sliding
   out from under the click. Use `middle-finger` for drag.
-- **The elbow pivot needs your arm in frame**, loads a second model, and buys
-  ergonomics rather than reach. If you are reaching for it purely to get
-  further, use `gain` and calibration instead.
+- **The elbow pivot does not work well.** It is retained for reference and left
+  as a documented dead end — see
+  [Why the elbow pivot underperforms](#why-the-elbow-pivot-underperforms). Do not
+  expect it to be usable, and do not reach for it to solve reach: use `gain` and
+  calibration, which can.
 - **Reaching the corners depends on calibration.** A narrow webcam field of view
   means you stretch to hit the edges; calibration amplifies whatever range you
   use, so a small range means more jitter near the edges.
