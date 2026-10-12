@@ -38,6 +38,7 @@ from .mapper import (
     load_projector,
     to_screen_space,
 )
+from .roles import RoleResolver
 
 LOST = "LOST"
 TRACKING = "TRACKING"
@@ -82,6 +83,7 @@ class App:
             click_method or cfg.click_method, cfg
         )
         self.fsm = gestures.ClickFSM.for_method(self.click_method, cfg)
+        self.roles = RoleResolver(cfg.two_hand.pointing_hand)
         self.guard = InputGuard()
 
         self.pivot = pivot or cfg.pivot
@@ -236,7 +238,7 @@ class App:
         connections_list = connections()
 
         self._install_signal_handlers()
-        with source, HandTracker(model) as tracker:
+        with source, HandTracker(model, num_hands=self.cfg.camera.num_hands) as tracker:
             view = None
             if self.preview:
                 view = overlay.Overlay(self.cfg.preview.window)
@@ -289,15 +291,16 @@ class App:
                 dt = (now - self._last_ts) / 1000.0 if self._last_ts else None
                 self._last_ts = now
 
-                hand = hands[0] if hands else None
-                points = hand.landmarks if hand is not None else None
+                # Which hand aims and which clicks. Sticky, so the two cannot
+                # swap back and forth while both hands are open.
+                pointing, clicking = self.roles.resolve(hands)
 
                 # Pose must run on the same pixels, so its coordinates line up
                 # with the hand landmarks.
                 elbow = None
                 if arm is not None:
                     elbow = arm.elbow(
-                        rgb, int(now), hand.handedness if hand is not None else None
+                        rgb, int(now), pointing.handedness if pointing is not None else None
                     )
 
                 if self.start_calibration:
@@ -305,7 +308,7 @@ class App:
                     self.start_calibration = False
                     continue
 
-                self._step(points, now, dt, frame, connections_list, view, elbow)
+                self._step(pointing, clicking, now, dt, frame, connections_list, view, elbow)
 
                 if self.preview and view is not None:
                     view.show(frame)
@@ -440,7 +443,16 @@ class App:
 
     # ------------------------------------------------------------------- step
 
-    def _step(self, points, now: float, dt, frame, connections_list, view, elbow=None) -> None:
+    def _step(self, pointing, clicking, now: float, dt, frame, connections_list, view, elbow=None) -> None:
+        """One frame.
+
+        ``pointing`` is the hand that aims, ``clicking`` the other one - which
+        is the same object for single-handed methods, since they do not use the
+        second role at all.
+        """
+        method = self.click_method
+        signal_hand = pointing if method.hand_role == gestures.ROLE_POINTING else clicking
+
         # 1. Has the real mouse been used? Check before we overwrite it.
         if self.guard.detect(self.cursor, now):
             if self.cursor.button_down:
@@ -449,7 +461,7 @@ class App:
             self._resume_since = None
             self._notify("physical mouse detected - pausing", now)
 
-        has_hand = points is not None
+        has_hand = pointing is not None
         if has_hand and self.guard.tripped:
             if self._resume_since is None:
                 self._resume_since = now
@@ -462,8 +474,13 @@ class App:
                 self._lost_since = None
                 self._notify("resumed", now)
 
-        if not has_hand:
-            self._resume_since = None
+        # Losing the hand this method *reads* is what releases the button. Losing
+        # only the aiming hand does not: the cursor freezes, but if you were
+        # dragging and your aiming hand dropped out of frame you are mid-gesture,
+        # not finished.
+        if signal_hand is None:
+            if self._resume_since is None:
+                self._resume_since = now
             if self._lost_since is None:
                 self._lost_since = now
             elif (now - self._lost_since) >= self.cfg.safety.hand_lost_release_ms:
@@ -474,23 +491,26 @@ class App:
         else:
             self._lost_since = None
 
-        # 2. Which pivot are we actually using this frame?
+        # 3. Which pivot are we actually using this frame?
         self._elbow_used = self._update_pivot(elbow, now)
 
         screen_point, aim_point = (None, None)
         if has_hand:
-            screen_point, aim_point = self._map_to_screen(points, now, dt, self._elbow_used)
+            screen_point, aim_point = self._map_to_screen(
+                pointing.landmarks, now, dt, self._elbow_used
+            )
             if screen_point is None:
                 has_hand = False
 
-        # 2. Gestures.
+        # 4. Gestures.
         clicked_now = False
-        if has_hand:
-            event = self.fsm.update(self.click_method.signal(points), int(now))
+        signal = method.signal(signal_hand.landmarks) if signal_hand is not None else None
+        if signal is not None:
+            event = self.fsm.update(signal, int(now))
             if event == gestures.PRESS:
                 self.cursor.press()
                 clicked_now = True
-                if self.click_method.freeze_on_press and screen_point is not None:
+                if method.freeze_on_press and screen_point is not None:
                     # Latch where you were aiming when the click started, so the
                     # distortion of the click gesture itself cannot move it.
                     self._click_anchor = screen_point
@@ -510,15 +530,29 @@ class App:
             target = self._click_anchor or screen_point
             self.guard.note_write(self.cursor.move(*target))
 
-        # 3. Draw.
+        # 5. Draw.
         if self.preview and view is not None:
-            self._draw(frame, points, aim_point, connections_list, now, has_hand, paused, clicked_now)
+            self._draw(
+                frame, pointing, clicking, aim_point, connections_list,
+                now, has_hand, paused, clicked_now,
+            )
 
-    def _draw(self, frame, points, aim_point, connections_list, now, has_hand, paused, clicked_now) -> None:
+    def _draw(self, frame, pointing, clicking, aim_point, connections_list,
+              now, has_hand, paused, clicked_now) -> None:
         method = self.click_method
-        if has_hand and points is not None:
-            highlight = set(method.highlight) if self.fsm.pressed else None
-            overlay.draw_hand(frame, points, connections_list, highlight=highlight)
+        signal_hand = pointing if method.hand_role == gestures.ROLE_POINTING else clicking
+
+        # Both hands are drawn when two-handed clicking is in use, because which
+        # one is doing what is otherwise invisible.
+        for hand, is_signal_hand in ((pointing, signal_hand is pointing),
+                                     (clicking, signal_hand is clicking)):
+            if hand is None or (hand is pointing and not has_hand):
+                continue
+            highlight = set(method.highlight) if (self.fsm.pressed and is_signal_hand) else None
+            overlay.draw_hand(frame, hand.landmarks, connections_list, highlight=highlight)
+
+        if has_hand and pointing is not None:
+            points = pointing.landmarks
             if method.name == gestures.PINCH:
                 signal = method.signal(points)
                 overlay.draw_pinch_gauge(
@@ -541,7 +575,7 @@ class App:
         else:
             state, colour = LOST, overlay._YELLOW
 
-        signal = method.signal(points) if has_hand else None
+        signal = method.signal(signal_hand.landmarks) if signal_hand is not None else None
         signal_text = f"{signal:.2f}" if signal is not None else "--"
 
         if self.pivot == PIVOT_ELBOW:
@@ -559,6 +593,10 @@ class App:
             (f"gain {self.gain:.2f}", overlay._WHITE),
             (f"click {method.label} {signal_text}", overlay._WHITE),
         ]
+        if method.hand_role == gestures.ROLE_CLICKING:
+            # Print the assignment: if MediaPipe's handedness is mirrored the
+            # wrong way round, this is the one line that makes it obvious.
+            lines.append((f"pointing hand: {self.roles.describe()}", overlay._CYAN))
         if self._notice and now < self._notice[1]:
             lines.append((self._notice[0], overlay._CYAN))
         lines.append((_HELP, overlay._GREY))
@@ -633,15 +671,17 @@ class App:
                 stamp = int(_now_ms())
                 hands = tracker.detect(rgb, stamp)
                 now = _now_ms()
-                hand = hands[0] if hands else None
-                points = hand.landmarks if hand is not None else None
+                # Calibrate with the same hand that will aim at runtime, or the
+                # fitted mapping describes a different geometry.
+                pointing, _clicking = self.roles.resolve(hands)
+                points = pointing.landmarks if pointing is not None else None
 
                 # Calibrate against the same pivot that will be used at runtime,
                 # or the fitted mapping describes a different geometry.
                 elbow = None
                 if arm is not None:
                     elbow = arm.elbow(
-                        rgb, stamp, hand.handedness if hand is not None else None
+                        rgb, stamp, pointing.handedness if pointing is not None else None
                     )
                 self._elbow_used = elbow
                 pivot = PIVOT_ELBOW if elbow is not None else PIVOT_WRIST

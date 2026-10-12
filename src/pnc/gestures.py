@@ -43,6 +43,7 @@ RELEASE = "release"
 
 MIDDLE_FINGER = "middle-finger"
 PINCH = "pinch"
+TWO_HAND = "two-hand"
 
 
 def middle_extension(pts) -> float | None:
@@ -73,6 +74,71 @@ def pinch_gap(pts) -> float | None:
     return math.dist(pts[L.THUMB_TIP], pts[L.INDEX_TIP]) / scale
 
 
+def finger_extension(pts, pip: int, tip: int) -> float | None:
+    """One finger's extension, as a wrist-distance ratio.
+
+    An extended finger puts the tip far beyond its PIP joint; a curled one
+    collapses the tip back towards the wrist. The PIP joint is the reference
+    because it barely moves when the finger folds.
+    """
+    wrist = pts[L.WRIST]
+    reference = math.dist(pts[pip], wrist)
+    if reference < 1e-6:
+        return None
+    return math.dist(pts[tip], wrist) / reference
+
+
+# The four fingers a fist closes. The thumb is deliberately excluded: it sits
+# outside the palm and barely moves when you close your hand, so including it
+# would wash out the signal.
+FIST_FINGERS = (
+    (L.INDEX_PIP, L.INDEX_TIP),
+    (L.MIDDLE_PIP, L.MIDDLE_TIP),
+    (L.RING_PIP, L.RING_TIP),
+    (L.PINKY_PIP, L.PINKY_TIP),
+)
+
+
+def fist_openness(pts) -> float | None:
+    """How open the hand is, averaged over the four fingers.
+
+    An open hand reads around 2.0-2.5; a closed fist around 1.0. Averaging four
+    fingers rather than trusting one matters, because single-finger landmarks
+    are exactly the noisy ones that make click thresholds flap.
+
+    The thumb is excluded on purpose: it sits outside the palm and barely moves
+    when a hand closes, so it contributes almost no signal.
+    """
+    values = [finger_extension(pts, pip, tip) for pip, tip in FIST_FINGERS]
+    usable = [v for v in values if v is not None]
+    if len(usable) < 3:  # too few measurable fingers to trust the average
+        return None
+    return sum(usable) / len(usable)
+
+
+def pointer_score(pts) -> float | None:
+    """How much this hand looks like it is *pointing* rather than gripping.
+
+    A pointing hand has its index extended while the other three stay relaxed.
+    A fist curls all four. Comparing the index against the mean of the rest
+    separates those cases with a wide margin, which is what lets the role
+    resolver tell your two hands apart without being told which is which.
+    """
+    index = finger_extension(pts, L.INDEX_PIP, L.INDEX_TIP)
+    if index is None:
+        return None
+
+    others = [
+        finger_extension(pts, pip, tip)
+        for pip, tip in FIST_FINGERS
+        if (pip, tip) != (L.INDEX_PIP, L.INDEX_TIP)
+    ]
+    usable = [v for v in others if v is not None]
+    if not usable:
+        return None
+    return index - (sum(usable) / len(usable))
+
+
 def finger_bend_degrees(pts, mcp: int, pip: int, tip: int) -> float | None:
     """Interior angle at the PIP joint. ~180 deg straight, <90 deg curled."""
     a = pts[mcp]
@@ -88,6 +154,11 @@ def finger_bend_degrees(pts, mcp: int, pip: int, tip: int) -> float | None:
 
     cosine = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
     return math.degrees(math.acos(cosine))
+
+
+# Which hand a method reads its signal from.
+ROLE_POINTING = "pointing"
+ROLE_CLICKING = "clicking"
 
 
 @dataclass(frozen=True)
@@ -106,6 +177,15 @@ class ClickMethod:
     freeze_on_press: bool
     highlight: tuple[int, ...]
     help: str
+    hand_role: str = ROLE_POINTING
+    """Which hand this method reads. Two-handed methods read the other one."""
+    max_hold_ms: int | None = None
+    """Overrides the global hold timeout. 0 disables it entirely.
+
+    A held fist is a legitimate long hold - selecting text, dragging a window -
+    so capping it would break the gesture rather than protect the user. The
+    other safety nets (hand lost, pause, exit) still apply.
+    """
 
     def signal(self, points) -> float | None:
         """The raw measurement for this frame, or None if unmeasurable."""
@@ -144,10 +224,27 @@ def build_click_method(name: str, cfg: "Config") -> ClickMethod:
             help="pinch thumb to index to click",
         )
 
+    if name == TWO_HAND:
+        return ClickMethod(
+            name=TWO_HAND,
+            label="fist (other hand)",
+            measure=fist_openness,
+            press_threshold=cfg.two_hand.fist_ratio,
+            release_threshold=cfg.two_hand.open_ratio,
+            # The aiming hand is a different hand entirely, so its movement
+            # cannot disturb the aim. Free to drag.
+            freeze_on_press=False,
+            highlight=(L.WRIST,),
+            help="point with one hand, close the other into a fist to click",
+            hand_role=ROLE_CLICKING,
+            # A fist held down is the gesture working as intended, not a fault.
+            max_hold_ms=cfg.two_hand.max_hold_ms,
+        )
+
     raise ValueError(f"Unknown click method {name!r}. Choose from {sorted(CLICK_METHOD_NAMES)}.")
 
 
-CLICK_METHOD_NAMES = (MIDDLE_FINGER, PINCH)
+CLICK_METHOD_NAMES = (MIDDLE_FINGER, PINCH, TWO_HAND)
 
 
 class ClickFSM:
@@ -184,11 +281,14 @@ class ClickFSM:
 
     @classmethod
     def for_method(cls, method: ClickMethod, cfg: "Config") -> "ClickFSM":
+        max_hold = (
+            cfg.gesture.max_hold_ms if method.max_hold_ms is None else method.max_hold_ms
+        )
         return cls(
             press_threshold=method.press_threshold,
             release_threshold=method.release_threshold,
             confirm_frames=cfg.gesture.confirm_frames,
-            max_hold_ms=cfg.gesture.max_hold_ms,
+            max_hold_ms=max_hold,
         )
 
     def _emit_release(self) -> str:
@@ -204,7 +304,9 @@ class ClickFSM:
             return None
 
         # Holding timeout: never let a misdetected press leave a button stuck.
-        if self.pressed and self._pressed_at_ms is not None:
+        # A max_hold_ms of 0 or less disables it, for gestures where a long hold
+        # is the point rather than a fault.
+        if self.pressed and self._pressed_at_ms is not None and self.max_hold_ms > 0:
             if now_ms - self._pressed_at_ms >= self.max_hold_ms:
                 self._armed = False
                 self.auto_released = True

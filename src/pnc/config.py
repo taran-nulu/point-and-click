@@ -43,6 +43,13 @@ class CameraConfig:
     that "further right" always means "further right on the cursor" and the
     preview reads as a mirror rather than as a video of someone else.
     """
+    num_hands: int = 2
+    """Hands to track.
+
+    Two even when only one is needed, because it measures free (the palm
+    detector dominates and runs once) and it lets the click method be switched
+    without rebuilding the tracker.
+    """
 
 
 @dataclass
@@ -129,6 +136,52 @@ class PinchConfig:
 
 
 @dataclass
+class TwoHandConfig:
+    """Two-handed clicking: point with one hand, click with a fist in the other.
+
+    The aiming hand is whichever the role resolver picks, and the click comes
+    from the *other* one - so clicking cannot disturb your aim at all.
+    """
+
+    pointing_hand: str = "auto"
+    """Which hand aims: "auto", "left", or "right".
+
+    "auto" picks the hand whose index finger is extended relative to its other
+    three, which separates a pointing hand from a fist by a wide margin. Pin it
+    if the automatic guess ever picks wrong - the preview HUD prints which hand
+    it settled on, so a swap is visible immediately.
+    """
+    fist_ratio: float = 0.6
+    """Mean finger extension at or below this counts as a closed fist.
+
+    Measured on a real resting hand: p5=0.52, median 0.92, p95=1.57. A
+    deliberate fist must land well under that spread, so this sits below the
+    resting p25 - otherwise resting triggers clicks on its own.
+    """
+    open_ratio: float = 0.85
+    """Mean finger extension at or above this counts as open. Must exceed
+    fist_ratio.
+
+    Deliberately *below* the resting median (0.92): after a click you relax your
+    hand rather than splaying it flat, so requiring a flat open hand would leave
+    you holding the button.
+
+    Both thresholds are close together because a relaxed hand and a fist are not
+    hugely different signals. That is a thin margin, and it is the reason to run
+    ``pnc doctor --gestures`` while actually clenching and releasing: it will
+    tell you if your hand never reaches these.
+    """
+    max_hold_ms: int = 0
+    """0 disables the hold timeout, so a fist stays down until you open it.
+
+    A long hold is what this gesture is for - selecting text, dragging a window
+    - so capping it would break the gesture rather than protect you. Every other
+    safety net still applies: losing your hands, pausing, switching method, and
+    quitting all force a release.
+    """
+
+
+@dataclass
 class ArmConfig:
     """Elbow detection for the ``elbow`` pivot."""
 
@@ -166,6 +219,7 @@ class Config:
     aim: AimConfig = field(default_factory=AimConfig)
     gesture: GestureConfig = field(default_factory=GestureConfig)
     pinch: PinchConfig = field(default_factory=PinchConfig)
+    two_hand: TwoHandConfig = field(default_factory=TwoHandConfig)
     arm: ArmConfig = field(default_factory=ArmConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)

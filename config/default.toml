@@ -1,7 +1,7 @@
 # Every tunable for point-and-click. This file is read at startup; nothing here
 # requires editing code.
 
-# Which gesture clicks: "middle-finger" or "pinch".
+# Which gesture clicks: "middle-finger", "pinch", or "two-hand".
 # Overridden by the --click-method flag on `pnc run`.
 click_method = "middle-finger"
 
@@ -98,6 +98,42 @@ release_ratio = 0.50
 # would slide as you close the pinch. Latching pins the click where you aimed.
 # The trade-off: pinch cannot drag. Use the middle-finger method for dragging.
 freeze_on_press = true
+
+[two_hand]
+# Click = close the *other* hand into a fist, while this hand points. Opening it
+# releases. Because the click comes from a different hand, it cannot disturb
+# your aim at all, and drag works.
+#
+#   openness = mean over index/middle/ring/pinky of
+#              |tip - wrist| / |pip - wrist|
+#
+# Measured on a real resting hand: p5=0.52, median 0.92, p95=1.57. A deliberate
+# fist lands well under that spread, so fist_ratio sits below the resting p25 -
+# any higher and resting on its own triggers clicks. open_ratio sits just below
+# the resting median, because after a click you relax your hand rather than
+# splaying it flat, and requiring a flat open hand leaves the button held down.
+#
+# The margin is thin, because a relaxed hand and a fist are not hugely different
+# signals. `pnc doctor --gestures` - run while you actually clench and release -
+# tells you whether your hand reaches these.
+fist_ratio = 0.60
+open_ratio = 0.85
+
+# Which hand aims: "auto", "left", or "right".
+#
+# "auto" picks the hand whose index finger is extended relative to its other
+# three, which tells a pointing hand from a fist by a wide margin, and sticks to
+# that answer so the roles cannot flap. The preview prints the assignment on a
+# `pointing hand:` line - if it names the wrong hand, pin it here.
+pointing_hand = "auto"
+
+# 0 disables the hold timeout, so a fist stays down until you open it.
+#
+# A long hold is the point of this gesture - selecting text, dragging a window
+# - so capping it would break the gesture rather than protect you. Every other
+# safety net still applies: losing your hands, pausing, switching method, and
+# quitting all force a release.
+max_hold_ms = 0
 
 [safety]
 hand_lost_release_ms = 250  # release the button this soon after losing your hand

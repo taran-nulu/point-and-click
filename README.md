@@ -9,7 +9,7 @@ Two things are configurable, because which feels best is personal:
 
 | | Options | Flag |
 |---|---|---|
-| **How to click** | `middle-finger` (default, supports drag), `pinch` | `--click-method` |
+| **How to click** | `middle-finger` (default, supports drag), `pinch`, `two-hand` | `--click-method` |
 | **What to pivot about** | `wrist` (default), `elbow` *(does not work well — see below)* | `--pivot` |
 
 > ### ⚠️ The elbow pivot does not work well
@@ -30,6 +30,7 @@ Two things are configurable, because which feels best is personal:
 ./run.sh calibrate           # teach it where you point
 ./run.sh run                                  # wrist pivot, middle-finger click
 ./run.sh run --click-method pinch             # pinch click
+./run.sh run --click-method two-hand          # point one hand, click with a fist in the other
 ./run.sh run --pivot elbow                    # experimental, see the warning above
 ```
 
@@ -193,29 +194,63 @@ not been done.
 
 ## Clicking
 
-Both methods reduce to the same measurement: **a signal that falls when you
+All three methods reduce to the same measurement: **a signal that falls when you
 press.** The middle finger's extension ratio drops as it folds; the pinch gap
-drops as your fingers close. So one state machine serves both.
+drops as your fingers close; fist openness drops as the hand closes. So one
+state machine serves all three.
 
-| Method | Signal | Press when | Release when |
-|---|---|---|---|
-| `middle-finger` | `\|middle_tip − wrist\| / \|middle_pip − wrist\|` | below `fold_ratio` | above `extend_ratio` |
-| `pinch` | `\|thumb_tip − index_tip\| / hand_scale` | below `press_ratio` | above `release_ratio` |
+| Method | Reads from | Signal | Press when | Release when |
+|---|---|---|---|---|
+| `middle-finger` | pointing hand | `\|middle_tip − wrist\| / \|middle_pip − wrist\|` | below `fold_ratio` | above `extend_ratio` |
+| `pinch` | pointing hand | `\|thumb_tip − index_tip\| / hand_scale` | below `press_ratio` | above `release_ratio` |
+| `two-hand` | **the other hand** | mean finger extension over four fingers | below `fist_ratio` | above `open_ratio` |
 
-Normalising both by a hand-sized reference is what makes the thresholds reusable
-at any distance from the camera.
+Normalising by a hand-sized reference is what makes the thresholds reusable at
+any distance from the camera.
 
 The two thresholds are deliberately different — a **hysteresis band**. Landmark
 noise is easily ±0.05 on these ratios, so a single threshold makes the click
 chatter open and shut whenever your hand rests near the boundary.
 
-**Pinch latches the cursor, middle-finger does not.** Pinching curls the index
+**Pinch latches the cursor, the others do not.** Pinching curls the index
 finger — the very finger doing the aiming — so the cursor would slide as you
 close the pinch and the click would land on whatever drifted underneath. So
 pinch mode latches the cursor position when the press fires. The cost is that
-pinch cannot drag; use the middle-finger method for that. The latch is taken at
-the press, so the small drift from your fingers closing is unavoidable — what is
-guaranteed is that the cursor stops moving for the rest of the click.
+pinch cannot drag. The latch is taken at the press, so the small drift from your
+fingers closing is unavoidable — what is guaranteed is that the cursor stops
+moving for the rest of the click.
+
+### Two hands: point with one, click with a fist in the other
+
+`--click-method two-hand` aims with one hand and takes the click from a closed
+fist in the other. Opening the fist releases, and it is held down until you do.
+
+Because the click comes from a hand that is not aiming, it **cannot disturb your
+aim at all**, and drag works. This is the most precise of the three, since a
+fist is a much larger, cleaner signal than a pinch.
+
+The tool has to work out which hand is which. A **sticky role resolver** picks
+the hand whose index is extended relative to its other three fingers — a
+pointing hand scores clearly positive, a fist clearly negative — and then holds
+that answer, only revisiting it if the assigned hand leaves frame. Stickiness is
+essential: with both hands open they look alike, and re-deciding every frame
+would swap roles constantly and fling the cursor between your hands.
+
+If MediaPipe's handedness ever picks the wrong arm, the preview prints
+`pointing hand: <side>` and you can pin it with `two_hand.pointing_hand` in the
+config. **I could not verify which way round handedness reads on our mirrored
+frame** — no hand has been in frame during any of my testing — so treat that one
+line in the HUD as the thing to check first.
+
+The hold timeout is **disabled** for this method (`max_hold_ms = 0`), because a
+long hold is the gesture working as intended rather than a fault: selecting
+text, dragging a window. Every other safety net still applies. Losing your
+clicking hand releases the button after a ~250 ms grace, so a single dropped
+detection frame mid-drag does not interrupt you.
+
+Losing only the *aiming* hand does **not** release: the cursor freezes, but if
+you were dragging and your aiming hand dropped out of frame you are mid-gesture,
+not finished.
 
 ### The thresholds are estimates, and they are personal
 
@@ -226,10 +261,15 @@ lot between hands. Measure yours rather than guessing:
 ./run.sh doctor --gestures
 ```
 
-Point normally, fold the middle finger, and pinch a few times while it counts.
-It prints the observed range for both signals against the configured
-thresholds, and tells you which way to move them if clicks would never fire or
-never release.
+Point normally, fold the middle finger, pinch, and close a hand into a fist and
+open it again, while it counts. It prints the observed range for all three
+signals against the configured thresholds, and tells you which way to move them
+if clicks would never fire or never release.
+
+The fist thresholds in particular are worth measuring. `fist_ratio` is set so a
+deliberate fist (≈0.25) presses and a *relaxed* hand (≈1.0) releases, because
+after a click you relax your hand rather than splaying it flat. Set
+`open_ratio` too high and relaxing will leave you holding the button down.
 
 ### Nothing gets stuck
 
@@ -262,6 +302,9 @@ reasoning inline.
 | `aim.median_window` | occasional wild jumps | legitimate fast motion gets eaten |
 | `gesture.fold_ratio` | clicks fire by accident | clicks miss |
 | `pinch.press_ratio` | pinches fire without pinching | pinches are missed |
+| `two_hand.fist_ratio` | the fist fires without you closing it | the fist is missed |
+| `two_hand.open_ratio` | clicks never release | it releases when you only relax |
+| `two_hand.pointing_hand` | `auto` picks the wrong arm | — |
 | `arm.min_visibility` | elbow jumps around | it falls back to the wrist too eagerly |
 | `arm.side` | `auto` picks the wrong arm | — |
 
@@ -280,19 +323,24 @@ red means closed enough to click.
 .venv/bin/python -m pytest
 ```
 
-130 tests, no camera or permissions required. They cover the aiming model's
-depth-invariance, both pivot geometries and the gain that matches them, both
-click signals, the click state machine's safety guarantees, pinch latching vs.
-middle-finger dragging, elbow fallback and dropout latching, the smoothing
-filters, the homography fit, doctor's threshold advice, and the full frame loop
-driven by synthetic landmarks against a fake cursor.
+155 tests, no camera or permissions required. They cover the aiming model's
+depth-invariance, both pivot geometries and the gain that matches them, all
+three click signals, the click state machine's safety guarantees, pinch latching
+vs. dragging, fist detection and the role resolver's stickiness, elbow fallback
+and dropout latching, the smoothing filters, the homography fit, doctor's
+threshold advice, and the full frame loop driven by synthetic landmarks against
+a fake cursor.
 
 ## Known limits
 
 - **One hand, index finger.** If you point with a different finger, or use the
   whole hand as a pointer, it will not track that.
 - **Pinch cannot drag**, by design — latching is what stops the cursor sliding
-  out from under the click. Use `middle-finger` for drag.
+  out from under the click. Use `middle-finger` or `two-hand` for drag.
+- **Two-handed clicking depends on the role resolver**, and I could not verify
+  MediaPipe's handedness against our mirrored frame without a hand in view.
+  Check the `pointing hand:` line in the HUD first; if it names the wrong hand,
+  pin `two_hand.pointing_hand`. Its thresholds are also unmeasured.
 - **The elbow pivot does not work well.** It is retained for reference and left
   as a documented dead end — see
   [Why the elbow pivot underperforms](#why-the-elbow-pivot-underperforms). Do not

@@ -32,8 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--from-video", help="replay a recording instead of using the camera")
     run.add_argument(
         "--click-method",
-        choices=("middle-finger", "pinch"),
-        help="how to click: fold the middle finger, or pinch thumb to index",
+        choices=("middle-finger", "pinch", "two-hand"),
+        help="how to click: fold the middle finger, pinch thumb to index, "
+        "or close the other hand into a fist",
     )
     run.add_argument(
         "--pivot",

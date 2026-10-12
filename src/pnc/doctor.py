@@ -20,6 +20,10 @@ _OK = "ok  "
 _BAD = "FAIL"
 _WARN = "warn"
 
+# How much of a hand's movement may sit in the dead band between press and
+# release before the thresholds are considered badly placed.
+MAX_DEAD_BAND_SHARE = 0.5
+
 
 def _line(ok: bool, label: str, detail: str = "") -> None:
     tag = _OK if ok else _BAD
@@ -193,26 +197,45 @@ def assess_thresholds(values, press: float, release: float) -> list[str]:
         return ["no samples"]
 
     p5, p25, _, p75, p95 = _percentiles(values)
-    warnings: list[str] = []
+    press_share = sum(1 for v in values if v <= press) / len(values)
+    release_share = sum(1 for v in values if v >= release) / len(values)
 
-    if p95 < release:
-        warnings.append(
-            f"your hand never reaches release={release}; no click would ever release. "
-            f"Lower it to about {p75:.2f}."
-        )
+    # The whole point of the gesture is to reach *both* extremes. If one is never
+    # reached, the likeliest explanation is that the gesture was not performed
+    # during the capture, not that the number is wrong - and telling someone to
+    # move the threshold onto their resting hand is actively harmful advice, since
+    # every resting frame would then fire a click.
+    missing = []
     if p5 > press:
-        warnings.append(
-            f"your hand never drops to press={press}; clicks would never fire. "
-            f"Raise it to about {p25:.2f}."
-        )
-    if p5 < press < release < p95:
-        return warnings
+        missing.append(("close", f"only {press_share * 100:.0f}% of samples would press"))
+    if p95 < release:
+        missing.append(("open", f"only {release_share * 100:.0f}% of samples would release"))
 
-    warnings.append(
-        "the thresholds sit inside your hand's rest range, so clicks will misfire. "
-        f"Try press={p5:.2f}, release={p95:.2f}, or move further from the camera."
-    )
-    return warnings
+    if missing:
+        what = " and ".join(m for m, _ in missing)
+        detail = "; ".join(d for _, d in missing)
+        return [
+            f"the signal never reached the {what} extreme of this gesture ({detail}). "
+            "That usually means the gesture was not actually performed during the "
+            "capture. Do it deliberately a few times and re-run before changing "
+            "thresholds - retuning them onto a resting hand would make every "
+            "resting frame fire a click."
+        ]
+
+    # Both extremes are reachable, but how much of ordinary hand movement falls
+    # between them? A wide band leaves your hand hovering in the dead zone, so
+    # clicks fire unreliably even though neither limit is impossible to hit.
+    in_band = sum(1 for v in values if press < v < release) / len(values)
+    if in_band > MAX_DEAD_BAND_SHARE:
+        return [
+            f"{in_band * 100:.0f}% of your samples land in the dead band between "
+            f"{press} and {release}, so your hand spends most of its time in the "
+            f"limbo where a click neither fires nor releases. Narrow the band - "
+            f"roughly press={p5 + (p95 - p5) * 0.35:.2f}, "
+            f"release={p5 + (p95 - p5) * 0.65:.2f}."
+        ]
+
+    return []
 
 
 def _gesture_report(duration_s: float, config) -> int:
@@ -230,19 +253,23 @@ def _gesture_report(duration_s: float, config) -> int:
 
     from .camera import Camera
     from .config import ensure_model
-    from .gestures import middle_extension, pinch_gap
+    from .gestures import fist_openness, middle_extension, pinch_gap
     from .hands import HandTracker
 
     print("\n  gesture report")
     print("  For the next few seconds: point normally, then fold the middle")
-    print("  finger, then pinch thumb to index. Do all three a few times.")
+    print("  finger, then pinch thumb to index, then close that hand into a")
+    print("  fist and open it again. Do all of them a few times.")
 
     middles: list[float] = []
     pinches: list[float] = []
+    fists: list[float] = []
     frames = 0
     hands_seen = 0
 
-    with Camera(index=config.camera.index) as cam, HandTracker(ensure_model()) as tracker:
+    with Camera(index=config.camera.index) as cam, HandTracker(
+        ensure_model(), num_hands=config.camera.num_hands
+    ) as tracker:
         deadline = _time.monotonic() + duration_s
         stamp = 0
         while _time.monotonic() < deadline:
@@ -260,12 +287,15 @@ def _gesture_report(duration_s: float, config) -> int:
                 for hand in found:
                     m = middle_extension(hand.landmarks)
                     p = pinch_gap(hand.landmarks)
+                    f = fist_openness(hand.landmarks)
                     if m is not None:
                         middles.append(m)
                     if p is not None:
                         pinches.append(p)
+                    if f is not None:
+                        fists.append(f)
 
-    if not middles and not pinches:
+    if not middles and not pinches and not fists:
         print("  No hand detected at all - check lighting and framing.")
         return 1
 
@@ -288,6 +318,14 @@ def _gesture_report(duration_s: float, config) -> int:
             config.pinch.release_ratio,
             "press_ratio",
             "release_ratio",
+        ),
+        (
+            "fist_openness (two-hand click)",
+            fists,
+            config.two_hand.fist_ratio,
+            config.two_hand.open_ratio,
+            "fist_ratio",
+            "open_ratio",
         ),
     ):
         if not values:

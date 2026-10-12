@@ -133,8 +133,17 @@ def app_pinch(monkeypatch):
     return instance
 
 
+def as_hand(points, handedness="Right"):
+    """Wrap raw landmarks in the Hand object the app now expects."""
+    from pnc.hands import Hand
+
+    return Hand(landmarks=points, handedness=handedness, score=0.99)
+
+
 def feed(app, points, now_ms: float, dt: float | None = None):
-    app._step(points, now_ms, dt, None, None, None)
+    """One frame with a single (pointing) hand."""
+    hand = as_hand(points) if points is not None else None
+    app._step(hand, None, now_ms, dt, None, None, None)
 
 
 def settled(app, points, frames: int = 40, start_ms: float = 0.0):
@@ -427,7 +436,9 @@ def test_cycling_click_methods_rebuilds_the_state_machine(app):
     assert app.fsm.press_threshold == app.click_method.press_threshold
     assert app.click_method.name in CLICK_METHOD_NAMES
 
-    app._cycle_click_method()
+    # A full cycle returns to where it started, whatever the method count.
+    for _ in range(len(CLICK_METHOD_NAMES) - 1):
+        app._cycle_click_method()
     assert app.click_method.name == start
 
 
@@ -458,7 +469,8 @@ def elbow_app(monkeypatch):
 
 
 def feed_elbow(app, points, elbow, now_ms: float, dt: float | None = None):
-    app._step(points, now_ms, dt, None, None, None, elbow)
+    hand = as_hand(points) if points is not None else None
+    app._step(hand, None, now_ms, dt, None, None, None, elbow)
 
 
 def settle_elbow(app, points, elbow, frames=40, start_ms=0.0):
